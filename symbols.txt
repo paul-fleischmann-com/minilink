@@ -1,0 +1,15 @@
+# minilink Symboltabelle (13 Eintraege, vor Placement)
+# Name                             Bindung   Status  Section            Offset           Quelldatei
+  <section:.text>                  LOCAL     DEF     .text              0x00000000000000   test/main.o
+  sys_exit                         LOCAL     DEF     .text              0x00000000000000   test/main.o
+  _start                           GLOBAL    DEF     .text              0x0000000000001d   test/main.o
+  print_message                    GLOBAL    UNDEF   -                  0x00000000000000   test/main.o
+  g_call_count                     GLOBAL    UNDEF   -                  0x00000000000000   test/main.o
+  <section:.text>                  LOCAL     DEF     .text              0x00000000000000   test/msg.o
+  <section:.rodata>                LOCAL     DEF     .rodata            0x00000000000000   test/msg.o
+  msg                              LOCAL     DEF     .rodata            0x00000000000000   test/msg.o
+  sys_write                        LOCAL     DEF     .text              0x00000000000000   test/msg.o
+  g_call_count                     GLOBAL    DEF     .bss               0x00000000000000   test/msg.o
+  g_call_count_notinit             GLOBAL    DEF     .bss               0x00000000000004   test/msg.o
+  g_flags                          GLOBAL    DEF     .data              0x00000000000000   test/msg.o
+  print_message                    GLOBAL    DEF     .text              0x0000000000002b   test/msg.o

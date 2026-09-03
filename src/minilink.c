@@ -129,11 +129,49 @@ static uint8_t *read_whole_file(const char *path, size_t *out_size) {
     return buf;
 }
 
+/* ELF64-Header lesbar auf stdout ausgeben (Debug-Hilfe) */
+static void print_ehdr(const char *path, const Elf64_Ehdr *e) {
+    printf("minilink: ELF-Header von %s\n", path);
+    printf("    e_ident   : %02x %02x %02x %02x  class=%u data=%u version=%u osabi=%u\n",
+           e->e_ident[0], e->e_ident[1], e->e_ident[2], e->e_ident[3],
+           e->e_ident[EI_CLASS], e->e_ident[EI_DATA],
+           e->e_ident[EI_VERSION], e->e_ident[EI_OSABI]);
+    printf("    e_type    : 0x%04x (%s)\n", e->e_type,
+           e->e_type == ET_REL  ? "ET_REL"  :
+           e->e_type == ET_EXEC ? "ET_EXEC" :
+           e->e_type == ET_DYN  ? "ET_DYN"  : "?");
+    printf("    e_machine : 0x%04x%s\n", e->e_machine,
+           e->e_machine == EM_X86_64 ? " (EM_X86_64)" : "");
+    printf("    e_version : %u\n", e->e_version);
+    printf("    e_entry   : 0x%lx\n", (unsigned long)e->e_entry);
+    printf("    e_phoff   : %lu\n", (unsigned long)e->e_phoff);
+    printf("    e_shoff   : %lu\n", (unsigned long)e->e_shoff);
+    printf("    e_flags   : 0x%x\n", e->e_flags);
+    printf("    e_ehsize  : %u\n", e->e_ehsize);
+    printf("    e_phentsize/e_phnum : %u / %u\n", e->e_phentsize, e->e_phnum);
+    printf("    e_shentsize/e_shnum : %u / %u\n", e->e_shentsize, e->e_shnum);
+    printf("    e_shstrndx: %u\n", e->e_shstrndx);
+}
+
 static int load_object_file(const char *path) {
     InputFile *f = &g_files[g_file_count];
     strncpy(f->filename, path, sizeof(f->filename) - 1);
     f->raw = read_whole_file(path, &f->raw_size);
     f->ehdr = (Elf64_Ehdr *)f->raw;
+    print_ehdr(path, f->ehdr);
+
+    /* f->ehdr zusaetzlich "plain" ausgeben: die rohen sizeof(Elf64_Ehdr)
+       Bytes als Hex-Dump, genau so wie sie in der Datei stehen */
+    printf("minilink: ELF-Header (plain, %zu Bytes) von %s\n",
+           sizeof(Elf64_Ehdr), path);
+    {
+        const unsigned char *p = (const unsigned char *)f->ehdr;
+        for (size_t i = 0; i < sizeof(Elf64_Ehdr); i++) {
+            if (i % 16 == 0) printf("    %04zx: ", i);
+            printf("%02x ", p[i]);
+            if (i % 16 == 15 || i + 1 == sizeof(Elf64_Ehdr)) printf("\n");
+        }
+    }
 
     if (memcmp(f->ehdr->e_ident, ELFMAG, SELFMAG) != 0) {
         fprintf(stderr, "minilink: %s ist keine gueltige ELF-Datei\n", path);
@@ -224,7 +262,7 @@ static void import_symbols(int file_index) {
            werden, damit find_symbol_by_origin() sie fuer die Relocation-
            Phase findet -- auch ohne brauchbaren Namen. */
         const char *raw_name = f->strtab + es->st_name;
-        char synth_name[64];
+        char synth_name[80];  /* "<section:" + name[64] + ">" + '\0' */
         const char *name = raw_name;
         if (type == STT_SECTION) {
             int target_id = shndx_map[file_index][es->st_shndx];
@@ -283,7 +321,37 @@ static int find_symbol_by_origin(int file_index, int orig_symidx) {
     return -1;
 }
 
+/* Schreibt alle bekannten Symbole (aus allen Eingabedateien) in eine
+   Textdatei. Wird von resolve_all_symbols() aufgerufen -- also VOR dem
+   Placement, daher steht final_address hier noch nicht zur Verfuegung. */
+static void dump_symbols(const char *path) {
+    FILE *sf = fopen(path, "w");
+    if (!sf) { perror(path); return; }
+
+    fprintf(sf, "# minilink Symboltabelle (%d Eintraege, vor Placement)\n", g_symbol_count);
+    fprintf(sf, "# %-32s %-9s %-7s %-18s %-16s %s\n",
+            "Name", "Bindung", "Status", "Section", "Offset", "Quelldatei");
+
+    for (int i = 0; i < g_symbol_count; i++) {
+        Sym *s = &g_symbols[i];
+        const char *bind   = s->is_global ? "GLOBAL" : "LOCAL";
+        const char *status = s->is_defined ? "DEF" : "UNDEF";
+        const char *section = (s->section_id >= 0)
+                                ? g_sections[s->section_id].name
+                                : "-";
+        fprintf(sf, "  %-32s %-9s %-7s %-18s 0x%014lx   %s\n",
+                s->name, bind, status, section,
+                (unsigned long)s->value,
+                g_files[s->file_index].filename);
+    }
+
+    fclose(sf);
+    printf("minilink: %d Symbol(e) nach %s geschrieben\n", g_symbol_count, path);
+}
+
 static void resolve_all_symbols(void) {
+    dump_symbols("symbols.txt");
+
     int unresolved_errors = 0;
     for (int i = 0; i < g_symbol_count; i++) {
         if (g_symbols[i].is_defined) continue;   /* wird erst in [4] final adressiert */
@@ -609,6 +677,34 @@ static void print_map(const Layout *L) {
     printf("=====================\n\n");
 }
 
+/* Schreibt alle geladenen Datei-Indizes samt Dateiname nach files.txt */
+static void dump_files(const int *file_indices, int n_inputs) {
+    FILE *ff = fopen("files.txt", "w");
+    if (!ff) { perror("files.txt"); return; }
+
+    fprintf(ff, "# minilink: %d Eingabedatei(en)\n", n_inputs);
+    fprintf(ff, "# %-10s %s\n", "file_index", "Dateiname");
+    for (int i = 0; i < n_inputs; i++)
+        fprintf(ff, "  %-10d %s\n",
+                file_indices[i], g_files[file_indices[i]].filename);
+
+    fclose(ff);
+    printf("minilink: %d Datei-Index/Indizes nach files.txt geschrieben\n", n_inputs);
+}
+
+/* Schreibt nur die reinen file_index-Werte (einer pro Zeile) nach
+   file_indices.txt */
+static void dump_file_indices(const int *file_indices, int n_inputs) {
+    FILE *fi = fopen("file_indices.txt", "w");
+    if (!fi) { perror("file_indices.txt"); return; }
+
+    for (int i = 0; i < n_inputs; i++)
+        fprintf(fi, "%d\n", file_indices[i]);
+
+    fclose(fi);
+    printf("minilink: %d file_index-Wert(e) nach file_indices.txt geschrieben\n", n_inputs);
+}
+
 /* ---------------------------------------------------------------------
  * Driver (siehe Dokument Abschnitt 11, Rolle "Driver")
  * ------------------------------------------------------------------- */
@@ -626,11 +722,19 @@ int main(int argc, char **argv) {
     /* [1] Reader */
     int file_indices[MAX_INPUT_FILES];
     for (int i = 0; i < n_inputs; i++)
-        file_indices[i] = load_object_file(argv[1 + i]);
+    {
+      file_indices[i] = load_object_file(argv[1 + i]);
+    }
 
-    for (int i = 0; i < n_inputs; i++) import_sections(file_indices[i]);
-    for (int i = 0; i < n_inputs; i++) import_symbols(file_indices[i]);
-    for (int i = 0; i < n_inputs; i++) import_relocations(file_indices[i]);
+    dump_files(file_indices, n_inputs);
+    dump_file_indices(file_indices, n_inputs);
+
+    for (int i = 0; i < n_inputs; i++)
+    {
+        import_sections(file_indices[i]);
+        import_symbols(file_indices[i]);
+        import_relocations(file_indices[i]);
+    }
 
     /* [2] Symbol-Resolver */
     resolve_all_symbols();

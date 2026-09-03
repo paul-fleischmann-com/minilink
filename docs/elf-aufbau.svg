@@ -1,0 +1,128 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="1120" viewBox="0 0 1000 1120" font-family="DejaVu Sans, Verdana, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#666"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="1000" height="1120" fill="#ffffff"/>
+  <text x="500" y="40" text-anchor="middle" font-size="24" font-weight="bold" fill="#222">Aufbau einer ELF64-Datei</text>
+  <text x="500" y="64" text-anchor="middle" font-size="13" fill="#666">Ausschnitt, wie ihn minilink nutzt: ET_REL als Eingabe, ET_EXEC als Ausgabe</text>
+
+  <!-- ================= Datei-Stack (linke Spalte) ================= -->
+  <text x="60" y="100" font-size="13" fill="#888">niedrige Offsets</text>
+  <line x1="60" y1="108" x2="60" y2="1040" stroke="#bbb" stroke-width="1" stroke-dasharray="3 3"/>
+  <text x="60" y="1060" font-size="13" fill="#888">hohe Offsets</text>
+
+  <!-- ELF-Header -->
+  <rect x="80" y="110" width="470" height="150" rx="6" fill="#E8F0FE" stroke="#3b6fd6" stroke-width="1.5"/>
+  <text x="96" y="132" font-size="15" font-weight="bold" fill="#1a3f8f">ELF-Header — Elf64_Ehdr (64 B, Offset 0)</text>
+  <text x="96" y="154" font-size="12.5" fill="#333">e_ident   = \x7fELF · class=64 · little endian</text>
+  <text x="96" y="172" font-size="12.5" fill="#333">e_type    = ET_REL (.o)  |  ET_EXEC (Programm)</text>
+  <text x="96" y="190" font-size="12.5" fill="#333">e_machine = EM_X86_64 (0x3e)</text>
+  <text x="96" y="208" font-size="12.5" fill="#333">e_entry   = virtuelle Einsprungadresse (nur EXEC)</text>
+  <text x="96" y="226" font-size="12.5" fill="#333">e_phoff  → Program Header Table   ·   e_phnum</text>
+  <text x="96" y="244" font-size="12.5" fill="#333">e_shoff  → Section Header Table   ·   e_shnum · e_shstrndx</text>
+
+  <!-- Program Header Table -->
+  <rect x="80" y="278" width="470" height="128" rx="6" fill="#FEF7E0" stroke="#d6a93b" stroke-width="1.5"/>
+  <text x="96" y="300" font-size="15" font-weight="bold" fill="#8a6a17">Program Header Table — Elf64_Phdr[]</text>
+  <text x="96" y="320" font-size="12" fill="#8a6a17">nur bei ET_EXEC / ET_DYN — bei .o nicht vorhanden</text>
+  <text x="96" y="342" font-size="12.5" fill="#333">PT_LOAD  R-X   ELF-Header + .text</text>
+  <text x="96" y="360" font-size="12.5" fill="#333">PT_LOAD  RW    .rodata + .data  (+ .bss über memsz &gt; filesz)</text>
+  <text x="96" y="382" font-size="12" fill="#555">p_offset · p_vaddr · p_filesz · p_memsz · p_align</text>
+
+  <!-- Section-Inhalte Container -->
+  <rect x="80" y="424" width="470" height="440" rx="6" fill="#ffffff" stroke="#999" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="96" y="444" font-size="13" font-weight="bold" fill="#666">Section-Inhalte (Reihenfolge nicht vorgeschrieben)</text>
+
+  <rect x="96" y="456" width="438" height="46" rx="4" fill="#EAF7EA" stroke="#4a9a4a"/>
+  <text x="108" y="474" font-size="13" font-weight="bold" fill="#2c6b2c">.text</text>
+  <text x="108" y="492" font-size="11.5" fill="#333">SHT_PROGBITS · ALLOC+EXEC · Maschinencode</text>
+
+  <rect x="96" y="508" width="438" height="46" rx="4" fill="#EAF7EA" stroke="#4a9a4a"/>
+  <text x="108" y="526" font-size="13" font-weight="bold" fill="#2c6b2c">.rodata</text>
+  <text x="108" y="544" font-size="11.5" fill="#333">SHT_PROGBITS · ALLOC · Konstanten, String-Literale</text>
+
+  <rect x="96" y="560" width="438" height="46" rx="4" fill="#EAF7EA" stroke="#4a9a4a"/>
+  <text x="108" y="578" font-size="13" font-weight="bold" fill="#2c6b2c">.data</text>
+  <text x="108" y="596" font-size="11.5" fill="#333">SHT_PROGBITS · ALLOC+WRITE · initialisierte Variablen</text>
+
+  <rect x="96" y="612" width="438" height="46" rx="4" fill="#F1F1F1" stroke="#999"/>
+  <text x="108" y="630" font-size="13" font-weight="bold" fill="#555">.bss</text>
+  <text x="108" y="648" font-size="11.5" fill="#333">SHT_NOBITS · 0 Bytes im File, sh_size &gt; 0 · Kernel nullt</text>
+
+  <rect x="96" y="664" width="438" height="46" rx="4" fill="#F3E8FD" stroke="#9a5ad6"/>
+  <text x="108" y="682" font-size="13" font-weight="bold" fill="#6a2ca0">.symtab</text>
+  <text x="108" y="700" font-size="11.5" fill="#333">SHT_SYMTAB · Elf64_Sym[] à 24 B · sh_link → .strtab</text>
+
+  <rect x="96" y="716" width="438" height="40" rx="4" fill="#F3E8FD" stroke="#9a5ad6"/>
+  <text x="108" y="734" font-size="13" font-weight="bold" fill="#6a2ca0">.strtab</text>
+  <text x="108" y="750" font-size="11.5" fill="#333">SHT_STRTAB · Symbolnamen als C-Strings</text>
+
+  <rect x="96" y="762" width="438" height="46" rx="4" fill="#FDE8E8" stroke="#d64a4a"/>
+  <text x="108" y="780" font-size="13" font-weight="bold" fill="#a02c2c">.rela.text / .rela.data</text>
+  <text x="108" y="798" font-size="11.5" fill="#333">SHT_RELA · r_offset · r_info(sym,typ) · r_addend</text>
+
+  <rect x="96" y="814" width="438" height="40" rx="4" fill="#F3E8FD" stroke="#9a5ad6"/>
+  <text x="108" y="832" font-size="13" font-weight="bold" fill="#6a2ca0">.shstrtab</text>
+  <text x="108" y="848" font-size="11.5" fill="#333">SHT_STRTAB · Section-Namen (e_shstrndx zeigt hierher)</text>
+
+  <!-- Section Header Table -->
+  <rect x="80" y="884" width="470" height="130" rx="6" fill="#E8F0FE" stroke="#3b6fd6" stroke-width="1.5"/>
+  <text x="96" y="906" font-size="15" font-weight="bold" fill="#1a3f8f">Section Header Table — Elf64_Shdr[] à 64 B</text>
+  <text x="96" y="926" font-size="12" fill="#1a3f8f">Offset = e_shoff · Index 0 = SHT_NULL</text>
+  <text x="96" y="948" font-size="12.5" fill="#333">pro Section: sh_name · sh_type · sh_flags · sh_addr</text>
+  <text x="96" y="966" font-size="12.5" fill="#333">sh_offset · sh_size · sh_link · sh_info</text>
+  <text x="96" y="984" font-size="12.5" fill="#333">sh_addralign · sh_entsize</text>
+  <text x="96" y="1004" font-size="12" fill="#777">minilink schreibt diese Tabelle im Executable NICHT (e_shoff = 0)</text>
+
+  <!-- ================= Pointer-Pfeile ================= -->
+  <path d="M 552 200 C 640 200, 640 330, 554 342" fill="none" stroke="#666" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="648" y="266" font-size="12" fill="#666">e_phoff</text>
+
+  <path d="M 552 240 C 720 250, 720 940, 554 946" fill="none" stroke="#666" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="726" y="600" font-size="12" fill="#666">e_shoff</text>
+
+  <path d="M 552 250 C 590 700, 470 815, 466 828" fill="none" stroke="#8a5ad6" stroke-width="1.3" stroke-dasharray="4 3" marker-end="url(#arrow)"/>
+  <text x="566" y="470" font-size="12" fill="#8a5ad6">e_shstrndx</text>
+
+  <path d="M 300 710 C 340 726, 340 726, 360 728" fill="none" stroke="#9a5ad6" stroke-width="1.3" marker-end="url(#arrow)"/>
+
+  <!-- ================= Rechte Infospalte ================= -->
+  <rect x="600" y="360" width="360" height="210" rx="8" fill="#F7F9FC" stroke="#aaa"/>
+  <text x="620" y="386" font-size="15" font-weight="bold" fill="#333">Zwei Sichten auf dieselben Bytes</text>
+
+  <text x="620" y="412" font-size="13" font-weight="bold" fill="#1a3f8f">Linking View</text>
+  <text x="620" y="431" font-size="12" fill="#333">Sections + Section Header Table.</text>
+  <text x="620" y="449" font-size="12" fill="#333">Das liest der Linker — minilink genau das.</text>
+
+  <text x="620" y="478" font-size="13" font-weight="bold" fill="#8a6a17">Execution View</text>
+  <text x="620" y="497" font-size="12" fill="#333">Segmente + Program Header Table.</text>
+  <text x="620" y="515" font-size="12" fill="#333">Das mappt der Kernel bei execve().</text>
+
+  <text x="620" y="544" font-size="12" fill="#333">ET_REL (.o): nur Linking View</text>
+  <text x="620" y="562" font-size="12" fill="#333">ET_EXEC: Execution View; minilink laesst</text>
+  <text x="620" y="580" font-size="12" fill="#333" dx="0">die Section Header komplett weg</text>
+
+  <!-- Adressraum-Plan (Ausgabe) -->
+  <rect x="600" y="600" width="360" height="270" rx="8" fill="#F7F9FC" stroke="#aaa"/>
+  <text x="620" y="626" font-size="15" font-weight="bold" fill="#333">Fester Adressraum der minilink-Ausgabe</text>
+
+  <rect x="620" y="642" width="320" height="70" rx="4" fill="#E8F0FE" stroke="#3b6fd6"/>
+  <text x="632" y="662" font-size="12" fill="#1a3f8f">0x400000  ELF-Header + Program-Header</text>
+  <text x="632" y="682" font-size="12" fill="#1a3f8f">0x401000  .text</text>
+  <text x="632" y="702" font-size="11.5" fill="#555">Segment 1 · PF_R | PF_X · filesz = memsz</text>
+
+  <rect x="620" y="722" width="320" height="128" rx="4" fill="#FEF7E0" stroke="#d6a93b"/>
+  <text x="632" y="742" font-size="12" fill="#8a6a17">0x402000  .rodata</text>
+  <text x="632" y="762" font-size="12" fill="#8a6a17">          .data</text>
+  <text x="632" y="782" font-size="12" fill="#8a6a17">          .bss  (nur im Speicher)</text>
+  <text x="632" y="806" font-size="11.5" fill="#555">Segment 2 · PF_R | PF_W</text>
+  <text x="632" y="824" font-size="11.5" fill="#555">p_filesz = rodata+data</text>
+  <text x="632" y="842" font-size="11.5" fill="#555">p_memsz  = + .bss   → Kernel nullt den Rest</text>
+
+  <text x="600" y="905" font-size="12" fill="#777">Relocation-Formeln:  S = Symboladresse · A = Addend · P = Patch-Stelle</text>
+  <text x="600" y="925" font-size="12" fill="#777">R_X86_64_64: S+A   ·   PC32/PLT32: S+A−P   ·   32/32S: S+A (zero/sign)</text>
+  <text x="600" y="945" font-size="12" fill="#777">Werkzeuge zum Gegenprüfen:  readelf -h/-S/-s/-r/-l · objdump -d</text>
+</svg>

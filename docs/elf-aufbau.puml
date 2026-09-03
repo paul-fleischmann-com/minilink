@@ -1,0 +1,65 @@
+@startuml elf-aufbau
+' Aufbau einer ELF64-Datei (Ausschnitt, wie von minilink genutzt)
+' Rendern:  plantuml -tsvg docs/elf-aufbau.puml
+
+title Aufbau einer ELF64-Datei
+
+skinparam shadowing false
+skinparam defaultFontName "DejaVu Sans"
+skinparam rectangle {
+  BorderColor #444444
+  BackgroundColor #FAFAFA
+}
+skinparam ArrowColor #666666
+
+rectangle "ELF64-Datei" as FILE {
+
+  rectangle "ELF-Header  (Elf64_Ehdr, 64 B, Offset 0)\l----\le_ident  = \\x7fELF, class=64, LSB\le_type   = ET_REL | ET_EXEC\le_machine= EM_X86_64\le_entry  = Einsprungadresse (nur EXEC)\le_phoff  --> Program Header Table\le_shoff  --> Section Header Table\le_shstrndx --> .shstrtab" as EH #E8F0FE
+
+  rectangle "Program Header Table  (Elf64_Phdr[])\lnur bei ET_EXEC / ET_DYN\l----\lPT_LOAD  R-X   ELF-Header + .text\lPT_LOAD  RW    .rodata + .data (+ .bss via memsz>filesz)\lp_offset / p_vaddr / p_filesz / p_memsz / p_align" as PHT #FEF7E0
+
+  package "Section-Inhalte" as SEC {
+    rectangle ".text\l(SHT_PROGBITS, ALLOC+EXEC)\lMaschinencode" as T #EAF7EA
+    rectangle ".rodata\l(SHT_PROGBITS, ALLOC)\lKonstanten, String-Literale" as RO #EAF7EA
+    rectangle ".data\l(SHT_PROGBITS, ALLOC+WRITE)\linitialisierte Variablen" as D #EAF7EA
+    rectangle ".bss\l(SHT_NOBITS, ALLOC+WRITE)\l0 Bytes im File, sh_size>0" as B #F1F1F1
+    rectangle ".symtab\l(SHT_SYMTAB, Elf64_Sym[] a 24 B)\lst_name/st_info/st_shndx/st_value\lsh_link --> .strtab" as ST #F3E8FD
+    rectangle ".strtab\l(SHT_STRTAB)\lSymbolnamen als C-Strings" as STR #F3E8FD
+    rectangle ".rela.text / .rela.data\l(SHT_RELA, Elf64_Rela[] a 24 B)\lr_offset / r_info(sym,typ) / r_addend\lsh_info --> Zielsection, sh_link --> .symtab" as RELA #FDE8E8
+    rectangle ".shstrtab\l(SHT_STRTAB)\lSection-Namen" as SHSTR #F3E8FD
+  }
+
+  rectangle "Section Header Table  (Elf64_Shdr[] a 64 B, Offset e_shoff)\l----\lpro Section: sh_name, sh_type, sh_flags,\lsh_addr, sh_offset, sh_size, sh_link, sh_info,\lsh_addralign, sh_entsize\l(Index 0 = SHT_NULL)" as SHT #E8F0FE
+}
+
+EH -down-> PHT   : e_phoff
+EH -down-> SHT   : e_shoff
+EH ..> SHSTR     : e_shstrndx
+SHT ..> T
+SHT ..> RO
+SHT ..> D
+SHT ..> B
+SHT ..> ST
+SHT ..> STR
+SHT ..> RELA
+SHT ..> SHSTR
+ST -right-> STR  : sh_link
+RELA ..> ST      : sh_link
+RELA ..> T       : sh_info
+PHT ..> T        : mappt
+PHT ..> RO       : mappt
+PHT ..> D        : mappt
+
+note right of EH
+  **Linking View**  = Sections + Section Header Table
+  (das sieht der Linker / minilink liest genau das)
+
+  **Execution View** = Segmente + Program Header Table
+  (das mappt der Kernel bei execve)
+
+  ET_REL  (.o) : nur Linking View
+  ET_EXEC     : Execution View; minilink laesst
+                die Section Header ganz weg
+end note
+
+@enduml
