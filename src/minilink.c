@@ -183,6 +183,12 @@ static int detect_tasking(const InputFile *f, const char **hit_section, const ch
             strncmp(name, ".debug_info", 11) != 0)
             continue;
 
+        /* Section-Bereich muss vollstaendig in der Datei liegen, sonst
+           liest buf_contains() ueber das Dateiende hinaus. */
+        if (sh->sh_offset > f->raw_size ||
+            sh->sh_size   > f->raw_size - sh->sh_offset)
+            continue;
+
         const uint8_t *data = f->raw + sh->sh_offset;
         for (int m = 0; markers[m]; m++)
             if (buf_contains(data, sh->sh_size, markers[m])) {
@@ -231,8 +237,6 @@ static int load_object_file(const char *path) {
     if (detect_tasking(f, &tk_sec, &tk_mark))
         printf("minilink: Hinweis: %s wurde offenbar mit einem TASKING-Toolset erzeugt "
                "(Marker \"%s\" in Section %s)\n", path, tk_mark, tk_sec);
-    else
-        printf("minilink: %s: kein TASKING-Marker gefunden\n", path);
 
     /* Symtab- und Strtab-Section finden */
     f->symtab = NULL;
@@ -300,15 +304,6 @@ static void import_symbols(int file_index) {
     if (!f->symtab) return;
 
     for (int i = 0; i < f->symtab_count; i++) {
-        printf("  symtab[%d] name=%u (%s) info=0x%02x (bind=%u type=%u) other=0x%02x shndx=%u value=0x%lx size=%lu\n",
-               i, f->symtab[i].st_name,
-               f->strtab ? f->strtab + f->symtab[i].st_name : "",
-               f->symtab[i].st_info,
-               ELF64_ST_BIND(f->symtab[i].st_info),
-               ELF64_ST_TYPE(f->symtab[i].st_info),
-               f->symtab[i].st_other, f->symtab[i].st_shndx,
-               (unsigned long)f->symtab[i].st_value,
-               (unsigned long)f->symtab[i].st_size);
         Elf64_Sym *es = &f->symtab[i];
         int type = ELF64_ST_TYPE(es->st_info);
         int bind = ELF64_ST_BIND(es->st_info);
@@ -495,11 +490,29 @@ static void load_ldl_script(const char *path) {
     if (!f) { perror(path); exit(1); }
 
     char line[256];
-    int lineno = 0, hits = 0;
+    int lineno = 0, hits = 0, in_block_comment = 0;
     while (fgets(line, sizeof(line), f)) {
         lineno++;
+
+        /* Kommentare entfernen, BEVOR geparst wird: C-Zeilenkommentare
+           (doppelter Schraegstrich bis Zeilenende) sowie C-Blockkommentare
+           (auch ueber mehrere Zeilen). Ein auskommentiertes #define -- auch
+           innerhalb eines Blockkommentars -- darf keine Wirkung haben. */
+        char clean[sizeof(line)];
+        size_t ci = 0;
+        for (size_t i = 0; line[i] && ci + 1 < sizeof(clean); i++) {
+            if (in_block_comment) {
+                if (line[i] == '*' && line[i + 1] == '/') { in_block_comment = 0; i++; }
+                continue;
+            }
+            if (line[i] == '/' && line[i + 1] == '*') { in_block_comment = 1; i++; continue; }
+            if (line[i] == '/' && line[i + 1] == '/') break;
+            clean[ci++] = line[i];
+        }
+        clean[ci] = '\0';
+
         char name[64], value[64];
-        if (sscanf(line, " #define %63s %63s", name, value) != 2)
+        if (sscanf(clean, " #define %63s %63s", name, value) != 2)
             continue;
 
         /* Integer-Suffix (u/U/l/L) abschneiden */
@@ -519,14 +532,17 @@ static void load_ldl_script(const char *path) {
         fprintf(stderr, "minilink: %s: BASE_ADDR fehlt (erwartet: #define BASE_ADDR <adresse>)\n", path);
         exit(1);
     }
-    if (g_page_size == 0 || (g_page_size & (g_page_size - 1)) != 0) {
-        fprintf(stderr, "minilink: %s: PAGE_SIZE (0x%lx) muss eine Zweierpotenz != 0 sein\n",
+    if (g_page_size < 0x1000 || (g_page_size & (g_page_size - 1)) != 0) {
+        fprintf(stderr, "minilink: %s: PAGE_SIZE (0x%lx) muss eine Zweierpotenz >= 0x1000 sein\n",
                 path, (unsigned long)g_page_size);
         exit(1);
     }
-    if (g_base_addr & (g_page_size - 1))
-        fprintf(stderr, "minilink: Warnung: BASE_ADDR (0x%lx) ist nicht page-aligned (PAGE_SIZE 0x%lx)\n",
-                (unsigned long)g_base_addr, (unsigned long)g_page_size);
+    if (g_base_addr & (g_page_size - 1)) {
+        fprintf(stderr, "minilink: %s: BASE_ADDR (0x%lx) ist nicht page-aligned "
+                "(PAGE_SIZE 0x%lx) -- das erzeugte ELF waere nicht ladbar\n",
+                path, (unsigned long)g_base_addr, (unsigned long)g_page_size);
+        exit(1);
+    }
 
     printf("minilink: LDL-Script %s geladen (%d Wert(e): BASE_ADDR=0x%lx PAGE_SIZE=0x%lx)\n",
            path, hits, (unsigned long)g_base_addr, (unsigned long)g_page_size);
@@ -700,10 +716,35 @@ static void apply_relocations(void) {
  * ELF64-Executable mit 2 PT_LOAD-Segmenten (R-X und RW).
  * ------------------------------------------------------------------- */
 
-static void write_section_group(FILE *out, SectionKind kind) {
-    for (int i = 0; i < g_section_count; i++)
-        if (g_sections[i].kind == kind && g_sections[i].data)
-            fwrite(g_sections[i].data, 1, g_sections[i].size, out);
+/* Schreibt eine gemergte Output-Section-Gruppe als zusammenhaengendes
+   Image von exakt `span` Bytes. Jede InSection wird an ihren in
+   place_sections() berechneten merged_offset kopiert; die Alignment-
+   Luecken dazwischen bleiben 0.
+
+   Frueher wurden die Sections nur roh aneinandergehaengt -- merged_offset
+   wurde ignoriert. Sobald eine Gruppe (typisch .data) an einer nicht
+   passend ausgerichteten Adresse begann, lag ihr Inhalt im File-Image um
+   die Alignment-Luecke verschoben, und alle .data-Symbole zeigten im
+   fertigen Executable auf Nullbytes statt auf ihre Initialwerte. */
+static void write_group_image(FILE *out, SectionKind kind, uint64_t span) {
+    uint8_t *img = calloc(1, span ? span : 1);
+    if (!img) { perror("calloc"); exit(1); }
+
+    for (int i = 0; i < g_section_count; i++) {
+        InSection *s = &g_sections[i];
+        if (s->kind != kind || !s->data) continue;
+        if (s->merged_offset + s->size > span) {
+            fprintf(stderr, "minilink: interner Fehler: Section '%s' passt nicht ins "
+                    "Gruppen-Image (0x%lx+0x%lx > 0x%lx)\n", s->name,
+                    (unsigned long)s->merged_offset, (unsigned long)s->size,
+                    (unsigned long)span);
+            exit(1);
+        }
+        memcpy(img + s->merged_offset, s->data, s->size);
+    }
+
+    fwrite(img, 1, span, out);
+    free(img);
 }
 
 static void write_output(const char *path, const Layout *L, uint64_t entry_addr) {
@@ -761,13 +802,17 @@ static void write_output(const char *path, const Layout *L, uint64_t entry_addr)
     uint64_t pos = sizeof(eh) + 2 * sizeof(Elf64_Phdr);
     while (pos < g_page_size) { fputc(0, out); pos++; }
 
-    write_section_group(out, KIND_TEXT);
+    write_group_image(out, KIND_TEXT, L->text_size);
     pos = g_page_size + L->text_size;
 
     while (pos < rw_file_offset) { fputc(0, out); pos++; }
 
-    write_section_group(out, KIND_RODATA);
-    write_section_group(out, KIND_DATA);
+    /* .rodata und .data bilden EIN zusammenhaengendes RW-Image:
+       data_vaddr == rodata_vaddr + rodata_size, also schliessen die
+       beiden Gruppen-Images (je exakt ihre span-Groesse) lueckenlos
+       aneinander an. */
+    write_group_image(out, KIND_RODATA, L->rodata_size);
+    write_group_image(out, KIND_DATA,   L->data_size);
     /* .bss wird NICHT in die Datei geschrieben (SHT_NOBITS-Prinzip) */
 
     fclose(out);
