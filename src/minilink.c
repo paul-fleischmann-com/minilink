@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <ctype.h>
 #include <elf.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -49,7 +50,8 @@ typedef struct {
     uint64_t    align;
     int         file_index;    /* aus welcher Eingabedatei */
     int         orig_shndx;    /* urspruenglicher Section-Index in dieser Datei */
-    uint64_t    merged_offset; /* Offset innerhalb der gemergten Output-Section */
+    int         segment;       /* 0 = R-X-PT_LOAD, 1 = RW-PT_LOAD (nach Placement) */
+    uint64_t    merged_offset; /* Offset ab Anfang des enthaltenden PT_LOAD-Segments */
 } InSection;
 
 typedef struct {
@@ -549,86 +551,427 @@ static void load_ldl_script(const char *path) {
 }
 
 static uint64_t align_up(uint64_t v, uint64_t a) {
+    if (a < 2) return v;
     return (v + a - 1) & ~(a - 1);
 }
 
+/* ---------------------------------------------------------------------
+ * TASKING-LSL-Reader (--lsl) -- stark vereinfachte Teilmenge
+ *
+ * Gelesen wird:
+ *   memory <id> {
+ *       type = rom | ram | nvram;
+ *       size = <zahl>[k|M|G];
+ *       map ( ... dest_offset = <adresse> ... );
+ *   }
+ *   section_layout [ ::<name> ] {
+ *       group [ ( ... run_addr = mem:<id> ... ) ] {
+ *           select "<pattern>";   // '*' am Ende = Praefix-Wildcard
+ *           ...
+ *       }
+ *   }
+ *
+ * Daraus:
+ *   - erste  type=rom-Region  -> Basisadresse des R-X-Segments  (g_base_addr)
+ *   - erste  type=ram-Region  -> Basisadresse des RW-Segments   (g_rw_base)
+ *   - Reihenfolge + Segment-Zuordnung der Output-Sections aus den groups
+ *
+ * Alles Uebrige (architecture, bus, derivative, core, section_setup, ...)
+ * wird per Klammer-Skip ueberlesen. Kommentare: // und C-Bloecke.
+ * ------------------------------------------------------------------- */
+
+#define LSL_MAX_MEM     16
+#define LSL_MAX_GROUPS  16
+#define LSL_MAX_SEL     32
+
+typedef struct { char id[32]; int is_ram; uint64_t addr; uint64_t size; } LslMem;
 typedef struct {
-    uint64_t text_vaddr, text_size;
-    uint64_t rodata_vaddr, rodata_size;
-    uint64_t data_vaddr, data_size;
-    uint64_t bss_vaddr, bss_size;
-    uint64_t rw_segment_file_start_vaddr; /* rodata+data zusammen im File-Image */
+    int  is_rw;                       /* run_addr zeigt auf eine type=ram-Region */
+    char run_mem[32];
+    char sel[LSL_MAX_SEL][48];
+    int  n_sel;
+} LslGroup;
+
+static LslMem   g_lsl_mem[LSL_MAX_MEM];    static int g_lsl_mem_n = 0;
+static LslGroup g_lsl_grp[LSL_MAX_GROUPS]; static int g_lsl_grp_n = 0;
+static uint64_t g_rw_base = 0;             /* RW-Segment-Basis (aus type=ram) */
+static int      g_use_lsl = 0;
+
+/* --- Lexer ---------------------------------------------------------- */
+enum { TOK_EOF, TOK_ID, TOK_NUM, TOK_STR, TOK_PUNC };
+typedef struct { int kind; char text[128]; uint64_t num; } Tok;
+
+static const char *g_lx;          /* Cursor in den (NUL-terminierten) Skriptpuffer */
+static Tok         g_tok;         /* aktuelles Token (1 Token Lookahead) */
+
+static uint64_t lsl_num(const char *s) {
+    char *end;
+    uint64_t v = strtoull(s, &end, 0);
+    if      (*end == 'k' || *end == 'K') v *= 1024ULL;
+    else if (*end == 'm' || *end == 'M') v *= 1024ULL * 1024;
+    else if (*end == 'g' || *end == 'G') v *= 1024ULL * 1024 * 1024;
+    return v;
+}
+
+static void lx_skip_ws(void) {
+    for (;;) {
+        while (*g_lx && (unsigned char)*g_lx <= ' ') g_lx++;
+        if (g_lx[0] == '/' && g_lx[1] == '/') {
+            while (*g_lx && *g_lx != '\n') g_lx++;
+            continue;
+        }
+        if (g_lx[0] == '/' && g_lx[1] == '*') {
+            g_lx += 2;
+            while (*g_lx && !(g_lx[0] == '*' && g_lx[1] == '/')) g_lx++;
+            if (*g_lx) g_lx += 2;
+            continue;
+        }
+        break;
+    }
+}
+
+static void adv(void) {
+    Tok t; t.kind = TOK_EOF; t.text[0] = '\0'; t.num = 0;
+    lx_skip_ws();
+    unsigned char c = (unsigned char)*g_lx;
+    if (!c) { g_tok = t; return; }
+
+    if (c == '"') {
+        g_lx++;
+        size_t n = 0;
+        while (*g_lx && *g_lx != '"' && n + 1 < sizeof t.text) t.text[n++] = *g_lx++;
+        t.text[n] = '\0';
+        if (*g_lx == '"') g_lx++;
+        t.kind = TOK_STR;
+    } else if (isdigit(c)) {
+        size_t n = 0;
+        while ((isalnum((unsigned char)*g_lx) || *g_lx == 'x' || *g_lx == 'X')
+               && n + 1 < sizeof t.text)
+            t.text[n++] = *g_lx++;
+        t.text[n] = '\0';
+        t.num = lsl_num(t.text);
+        t.kind = TOK_NUM;
+    } else if (isalpha(c) || c == '_' || c == '.') {
+        size_t n = 0;
+        while ((isalnum((unsigned char)*g_lx) || *g_lx == '_' || *g_lx == '.' || *g_lx == '*')
+               && n + 1 < sizeof t.text)
+            t.text[n++] = *g_lx++;
+        t.text[n] = '\0';
+        t.kind = TOK_ID;
+    } else {
+        t.kind = TOK_PUNC;
+        t.text[0] = *g_lx++;
+        t.text[1] = '\0';
+    }
+    g_tok = t;
+}
+
+static int is_punc(char p) { return g_tok.kind == TOK_PUNC && g_tok.text[0] == p; }
+static int is_id(const char *s) { return g_tok.kind == TOK_ID && strcmp(g_tok.text, s) == 0; }
+
+/* Ab der aktuellen Position bis hinter das passende '}' bzw. bis ';'
+   auf Tiefe 0 (fuer nicht unterstuetzte Konstrukte). */
+static void skip_unknown(void) {
+    int depth = 0, saw_brace = 0;
+    while (g_tok.kind != TOK_EOF) {
+        if (is_punc('{')) { depth++; saw_brace = 1; adv(); continue; }
+        if (is_punc('}')) { depth--; adv(); if (saw_brace && depth <= 0) return; continue; }
+        if (is_punc(';') && depth == 0 && !saw_brace) { adv(); return; }
+        adv();
+    }
+}
+
+/* --- Parser ------------------------------------------------------- */
+static void lsl_parse_memory(void) {
+    adv();                                        /* -> <id> */
+    LslMem m; memset(&m, 0, sizeof m);
+    if (g_tok.kind == TOK_ID) { strncpy(m.id, g_tok.text, sizeof m.id - 1); adv(); }
+    if (!is_punc('{')) { skip_unknown(); return; }
+    adv();
+
+    int depth = 1;
+    while (depth > 0 && g_tok.kind != TOK_EOF) {
+        if (is_punc('{')) { depth++; adv(); continue; }
+        if (is_punc('}')) { depth--; adv(); continue; }
+
+        if (depth == 1 && is_id("type")) {
+            adv(); if (is_punc('=')) adv();
+            if (g_tok.kind == TOK_ID)
+                m.is_ram = (strcmp(g_tok.text, "ram") == 0 || strcmp(g_tok.text, "nvram") == 0);
+            adv();
+            continue;
+        }
+        if (depth == 1 && is_id("size")) {
+            adv(); if (is_punc('=')) adv();
+            if (g_tok.kind == TOK_NUM) m.size = g_tok.num;
+            adv();
+            continue;
+        }
+        if (is_id("map")) {
+            adv();                                /* '(' ... ')' scannen */
+            int pd = 0;
+            while (g_tok.kind != TOK_EOF) {
+                if (is_punc('(')) { pd++; adv(); continue; }
+                if (is_punc(')')) { pd--; adv(); if (pd <= 0) break; continue; }
+                if (is_id("dest_offset")) {
+                    adv(); if (is_punc('=')) adv();
+                    if (g_tok.kind == TOK_NUM) m.addr = g_tok.num;
+                    continue;
+                }
+                adv();
+            }
+            continue;
+        }
+        adv();
+    }
+
+    if (m.id[0] && g_lsl_mem_n < LSL_MAX_MEM) g_lsl_mem[g_lsl_mem_n++] = m;
+    else if (m.id[0]) fprintf(stderr, "minilink: LSL: zu viele memory-Regionen, '%s' ignoriert\n", m.id);
+}
+
+static void lsl_parse_group(void) {
+    adv();                                        /* nach 'group' */
+    LslGroup g; memset(&g, 0, sizeof g);
+
+    if (is_punc('(')) {
+        adv();
+        while (!is_punc(')') && g_tok.kind != TOK_EOF) {
+            if (is_id("run_addr") || is_id("load_addr")) {
+                int is_run = is_id("run_addr");
+                adv(); if (is_punc('=')) adv();
+                if (is_id("mem")) {
+                    adv(); if (is_punc(':')) adv();
+                    if (is_run && g_tok.kind == TOK_ID)
+                        strncpy(g.run_mem, g_tok.text, sizeof g.run_mem - 1);
+                    if (g_tok.kind == TOK_ID) adv();
+                } else {
+                    adv();
+                }
+                continue;
+            }
+            adv();
+        }
+        if (is_punc(')')) adv();
+    }
+
+    if (!is_punc('{')) { skip_unknown(); return; }
+    adv();
+    while (!is_punc('}') && g_tok.kind != TOK_EOF) {
+        if (is_id("select")) {
+            adv();
+            if (g_tok.kind == TOK_STR || g_tok.kind == TOK_ID) {
+                if (g.n_sel < LSL_MAX_SEL)
+                    strncpy(g.sel[g.n_sel++], g_tok.text, sizeof g.sel[0] - 1);
+                adv();
+            }
+            if (is_punc(';')) adv();
+        } else if (is_id("group")) {
+            fprintf(stderr, "minilink: LSL: verschachtelte group wird ignoriert\n");
+            adv();
+            skip_unknown();
+        } else {
+            adv();
+        }
+    }
+    if (is_punc('}')) adv();
+
+    if (g.run_mem[0]) {
+        int found = 0;
+        for (int i = 0; i < g_lsl_mem_n; i++)
+            if (strcmp(g_lsl_mem[i].id, g.run_mem) == 0) { g.is_rw = g_lsl_mem[i].is_ram; found = 1; }
+        if (!found)
+            fprintf(stderr, "minilink: LSL: group run_addr = mem:%s -- unbekannte Region\n", g.run_mem);
+    }
+    if (g.n_sel > 0 && g_lsl_grp_n < LSL_MAX_GROUPS) g_lsl_grp[g_lsl_grp_n++] = g;
+}
+
+static void lsl_parse_section_layout(void) {
+    adv();                                        /* nach 'section_layout' */
+    while (is_punc(':')) adv();                   /* optionales ::name */
+    if (g_tok.kind == TOK_ID) adv();
+    if (!is_punc('{')) { skip_unknown(); return; }
+    adv();
+    while (!is_punc('}') && g_tok.kind != TOK_EOF) {
+        if (is_id("group"))       lsl_parse_group();
+        else if (is_id("select")) {              /* select ausserhalb group: ignorieren */
+            adv(); if (g_tok.kind == TOK_STR || g_tok.kind == TOK_ID) adv();
+            if (is_punc(';')) adv();
+        } else adv();
+    }
+    if (is_punc('}')) adv();
+}
+
+static void load_lsl_script(const char *path) {
+    size_t sz;
+    uint8_t *raw = read_whole_file(path, &sz);
+    char *buf = malloc(sz + 1);
+    if (!buf) { perror("malloc"); exit(1); }
+    memcpy(buf, raw, sz);
+    buf[sz] = '\0';
+    free(raw);
+
+    g_lx = buf;
+    adv();
+    while (g_tok.kind != TOK_EOF) {
+        if (is_id("memory"))              lsl_parse_memory();
+        else if (is_id("section_layout")) lsl_parse_section_layout();
+        else if (g_tok.kind == TOK_ID)    { adv(); skip_unknown(); }
+        else                              adv();
+    }
+    free(buf);
+
+    int rom_i = -1, ram_i = -1;
+    for (int i = 0; i < g_lsl_mem_n; i++) {
+        if (!g_lsl_mem[i].is_ram && rom_i < 0) rom_i = i;
+        if ( g_lsl_mem[i].is_ram && ram_i < 0) ram_i = i;
+    }
+    if (rom_i < 0) {
+        fprintf(stderr, "minilink: %s: keine 'memory' mit type=rom gefunden\n", path);
+        exit(1);
+    }
+
+    g_base_addr = g_lsl_mem[rom_i].addr;
+    g_rw_base   = (ram_i >= 0) ? g_lsl_mem[ram_i].addr : 0;
+    g_page_size = 0x1000;            /* LSL kennt keine Page-Size -> ELF-Standardwert */
+    g_use_lsl   = 1;
+
+    if (g_base_addr == 0 || (g_base_addr & (g_page_size - 1))) {
+        fprintf(stderr, "minilink: %s: rom-Adresse 0x%lx fehlt oder nicht 0x%lx-aligned\n",
+                path, (unsigned long)g_base_addr, (unsigned long)g_page_size);
+        exit(1);
+    }
+    if (g_rw_base && (g_rw_base & (g_page_size - 1))) {
+        fprintf(stderr, "minilink: %s: ram-Adresse 0x%lx nicht 0x%lx-aligned\n",
+                path, (unsigned long)g_rw_base, (unsigned long)g_page_size);
+        exit(1);
+    }
+
+    printf("minilink: LSL %s geladen: %d memory-Region(en), %d group(s); rom@0x%lx ram@0x%lx\n",
+           path, g_lsl_mem_n, g_lsl_grp_n,
+           (unsigned long)g_base_addr, (unsigned long)g_rw_base);
+}
+
+/* '*' am Ende = Praefix-Match, sonst exakter Vergleich */
+static int sel_match(const char *pat, const char *name) {
+    size_t pl = strlen(pat);
+    if (pl && pat[pl - 1] == '*') return strncmp(pat, name, pl - 1) == 0;
+    return strcmp(pat, name) == 0;
+}
+
+typedef struct {
+    uint64_t rx_vaddr, rx_file_size;                            /* Segment 0: File-Offset 0, enthaelt ELF-Header */
+    uint64_t rw_vaddr, rw_file_off, rw_file_size, rw_mem_size;  /* Segment 1 */
 } Layout;
 
-static Layout place_sections(void) {
+/* Platziert die Sektionen aus idx[0..n) fortlaufend ab *cursor (Offset ab
+   Segmentanfang), setzt segment + merged_offset, beachtet Alignment. */
+static void place_run(const int *idx, int n, int segment, uint64_t *cursor) {
+    for (int k = 0; k < n; k++) {
+        InSection *s = &g_sections[idx[k]];
+        *cursor = align_up(*cursor, s->align);
+        s->segment = segment;
+        s->merged_offset = *cursor;
+        *cursor += s->size;
+    }
+}
+
+/* Baut das gemeinsame Layout aus drei Section-Listen (schon in
+   Ziel-Reihenfolge): rx[] -> R-X-Segment, rw[] -> RW-PROGBITS,
+   bs[] -> RW-NOBITS (.bss). rw_base = 0 -> RW direkt hinter R-X. */
+static Layout finalize_layout(const int *rx, int n_rx,
+                              const int *rw, int n_rw,
+                              const int *bs, int n_bs,
+                              uint64_t rw_base) {
     Layout L = {0};
 
-    /* Kopfbereich: ELF-Header + 1 Program-Header reservieren wir vorab
-       (wird in write_output() exakt berechnet; hier grob genug fuer Alignment) */
-    uint64_t cursor = g_base_addr + g_page_size;   /* .text beginnt an einer Page-Grenze */
+    /* Segment 0 (R-X): erste g_page_size Bytes = ELF-Header + Program-Header */
+    uint64_t cur = g_page_size;
+    place_run(rx, n_rx, 0, &cur);
+    L.rx_vaddr     = g_base_addr;
+    L.rx_file_size = cur;
 
-    L.text_vaddr = cursor;
-    for (int i = 0; i < g_section_count; i++) {
-        if (g_sections[i].kind != KIND_TEXT) continue;
-        cursor = align_up(cursor, g_sections[i].align);
-        g_sections[i].merged_offset = cursor - L.text_vaddr;
-        cursor += g_sections[i].size;
+    L.rw_file_off = align_up(L.rx_file_size, g_page_size);
+    L.rw_vaddr    = rw_base ? rw_base : align_up(g_base_addr + L.rx_file_size, g_page_size);
+
+    uint64_t rcur = 0;
+    place_run(rw, n_rw, 1, &rcur);
+    L.rw_file_size = rcur;                 /* .bss traegt NICHT zum File-Image bei */
+    place_run(bs, n_bs, 1, &rcur);
+    L.rw_mem_size  = rcur;                 /* ... wohl aber zum Speicherabbild     */
+
+    uint64_t rx_end = L.rx_vaddr + L.rx_file_size;
+    uint64_t rw_end = L.rw_vaddr + L.rw_mem_size;
+    if (L.rw_mem_size && L.rx_vaddr < rw_end && L.rw_vaddr < rx_end) {
+        fprintf(stderr, "minilink: R-X- und RW-Bereich ueberlappen "
+                "(R-X 0x%lx..0x%lx, RW 0x%lx..0x%lx)\n",
+                (unsigned long)L.rx_vaddr, (unsigned long)rx_end,
+                (unsigned long)L.rw_vaddr, (unsigned long)rw_end);
+        exit(1);
     }
-    L.text_size = cursor - L.text_vaddr;
-
-    /* Naechstes Segment (RW: .rodata + .data) beginnt an neuer Page */
-    cursor = align_up(cursor, g_page_size);
-    L.rw_segment_file_start_vaddr = cursor;
-
-    L.rodata_vaddr = cursor;
-    for (int i = 0; i < g_section_count; i++) {
-        if (g_sections[i].kind != KIND_RODATA) continue;
-        cursor = align_up(cursor, g_sections[i].align);
-        g_sections[i].merged_offset = cursor - L.rodata_vaddr;
-        cursor += g_sections[i].size;
-    }
-    L.rodata_size = cursor - L.rodata_vaddr;
-
-    L.data_vaddr = cursor;
-    for (int i = 0; i < g_section_count; i++) {
-        if (g_sections[i].kind != KIND_DATA) continue;
-        cursor = align_up(cursor, g_sections[i].align);
-        g_sections[i].merged_offset = cursor - L.data_vaddr;
-        cursor += g_sections[i].size;
-    }
-    L.data_size = cursor - L.data_vaddr;
-
-    /* .bss folgt direkt danach im virtuellen Adressraum, hat aber KEINEN
-       Platz im File-Image (das ist der Sinn von SHT_NOBITS / memsz > filesz) */
-    L.bss_vaddr = cursor;
-    for (int i = 0; i < g_section_count; i++) {
-        if (g_sections[i].kind != KIND_BSS) continue;
-        cursor = align_up(cursor, g_sections[i].align);
-        g_sections[i].merged_offset = cursor - L.bss_vaddr;
-        cursor += g_sections[i].size;
-    }
-    L.bss_size = cursor - L.bss_vaddr;
-
     return L;
+}
+
+/* Default-Layout (Script per -T): .text -> R-X; .rodata/.data/.bss -> RW,
+   RW-Segment direkt an der naechsten Page-Grenze hinter .text. */
+static Layout place_sections_default(void) {
+    int rx[MAX_SECTIONS], rw[MAX_SECTIONS], bs[MAX_SECTIONS];
+    int n_rx = 0, n_rw = 0, n_bs = 0;
+
+    for (int i = 0; i < g_section_count; i++)
+        if (g_sections[i].kind == KIND_TEXT) rx[n_rx++] = i;
+    for (int i = 0; i < g_section_count; i++)
+        if (g_sections[i].kind == KIND_RODATA) rw[n_rw++] = i;
+    for (int i = 0; i < g_section_count; i++)
+        if (g_sections[i].kind == KIND_DATA) rw[n_rw++] = i;
+    for (int i = 0; i < g_section_count; i++)
+        if (g_sections[i].kind == KIND_BSS) bs[n_bs++] = i;
+
+    return finalize_layout(rx, n_rx, rw, n_rw, bs, n_bs, 0);
+}
+
+/* LSL-Layout (--lsl): Reihenfolge und Segment aus section_layout/group/
+   select; nicht erfasste Sektionen werden nach Typ einsortiert. */
+static Layout place_sections_lsl(void) {
+    int rx[MAX_SECTIONS], rw[MAX_SECTIONS], bs[MAX_SECTIONS];
+    int n_rx = 0, n_rw = 0, n_bs = 0;
+    int claimed[MAX_SECTIONS];
+    for (int i = 0; i < g_section_count; i++) claimed[i] = 0;
+
+    for (int gi = 0; gi < g_lsl_grp_n; gi++) {
+        LslGroup *g = &g_lsl_grp[gi];
+        for (int si = 0; si < g->n_sel; si++)
+            for (int i = 0; i < g_section_count; i++) {
+                if (claimed[i] || !sel_match(g->sel[si], g_sections[i].name)) continue;
+                claimed[i] = 1;
+                if (g_sections[i].kind == KIND_BSS) bs[n_bs++] = i;
+                else if (g->is_rw)                  rw[n_rw++] = i;
+                else                                rx[n_rx++] = i;
+            }
+    }
+    for (int i = 0; i < g_section_count; i++) {
+        if (claimed[i]) continue;
+        fprintf(stderr, "minilink: LSL: Section '%s' von keiner group erfasst -- "
+                "nach Typ einsortiert\n", g_sections[i].name);
+        switch (g_sections[i].kind) {
+            case KIND_TEXT: case KIND_RODATA: rx[n_rx++] = i; break;
+            case KIND_DATA:                   rw[n_rw++] = i; break;
+            case KIND_BSS:                    bs[n_bs++] = i; break;
+            default: break;
+        }
+    }
+
+    return finalize_layout(rx, n_rx, rw, n_rw, bs, n_bs, g_rw_base);
 }
 
 /* Nachdem Sections platziert sind: jedem Symbol seine finale Adresse geben */
 static void assign_symbol_addresses(const Layout *L) {
-    (void)L;
     for (int i = 0; i < g_symbol_count; i++) {
         Sym *s = &g_symbols[i];
         if (!s->is_defined) continue;
         if (s->section_id < 0) { s->resolved = 1; s->final_address = 0; continue; } /* abs. Symbol, hier ungenutzt */
 
         InSection *sec = &g_sections[s->section_id];
-        uint64_t section_base;
-        switch (sec->kind) {
-            case KIND_TEXT:   section_base = L->text_vaddr;   break;
-            case KIND_RODATA: section_base = L->rodata_vaddr; break;
-            case KIND_DATA:   section_base = L->data_vaddr;   break;
-            case KIND_BSS:    section_base = L->bss_vaddr;    break;
-            default: continue;
-        }
+        uint64_t section_base = (sec->segment == 0) ? L->rx_vaddr : L->rw_vaddr;
         s->final_address = section_base + sec->merged_offset + s->value;
         s->resolved = 1;
     }
@@ -661,14 +1004,9 @@ static void apply_relocations(void) {
         int64_t  A = r->addend;            /* konstanter Offset aus der Relocation */
 
         /* P = finale virtuelle Adresse der Patch-Stelle selbst
-           (Section-Basis im Layout + Merge-Offset innerhalb der Zielgruppe + lokaler Offset) */
-        uint64_t section_base;
-        switch (sec->kind) {
-            case KIND_TEXT:   section_base = g_layout_for_reloc.text_vaddr;   break;
-            case KIND_RODATA: section_base = g_layout_for_reloc.rodata_vaddr; break;
-            case KIND_DATA:   section_base = g_layout_for_reloc.data_vaddr;   break;
-            default: continue;
-        }
+           (Segment-Basis + Offset der Section im Segment + lokaler Offset) */
+        uint64_t section_base = (sec->segment == 0) ? g_layout_for_reloc.rx_vaddr
+                                                    : g_layout_for_reloc.rw_vaddr;
         uint64_t P = section_base + sec->merged_offset + r->offset;
 
         /* sec->data enthaelt die rohen Bytes genau dieser einen InSection;
@@ -716,35 +1054,30 @@ static void apply_relocations(void) {
  * ELF64-Executable mit 2 PT_LOAD-Segmenten (R-X und RW).
  * ------------------------------------------------------------------- */
 
-/* Schreibt eine gemergte Output-Section-Gruppe als zusammenhaengendes
-   Image von exakt `span` Bytes. Jede InSection wird an ihren in
-   place_sections() berechneten merged_offset kopiert; die Alignment-
-   Luecken dazwischen bleiben 0.
-
-   Frueher wurden die Sections nur roh aneinandergehaengt -- merged_offset
-   wurde ignoriert. Sobald eine Gruppe (typisch .data) an einer nicht
-   passend ausgerichteten Adresse begann, lag ihr Inhalt im File-Image um
-   die Alignment-Luecke verschoben, und alle .data-Symbole zeigten im
-   fertigen Executable auf Nullbytes statt auf ihre Initialwerte. */
-static void write_group_image(FILE *out, SectionKind kind, uint64_t span) {
+/* Baut das komplette Byte-Image eines PT_LOAD-Segments (`seg` = 0 R-X,
+   1 RW) in einem calloc-genullten Puffer von `span` Bytes: jede InSection
+   dieses Segments wird an ihren merged_offset kopiert, .bss (kein data)
+   uebersprungen, Alignment-Luecken bleiben 0. `prefix`/`prefix_len` wird
+   an Offset 0 vorangestellt (fuer den ELF-Header im R-X-Segment). */
+static uint8_t *build_segment_image(int seg, uint64_t span,
+                                    const void *prefix, size_t prefix_len) {
     uint8_t *img = calloc(1, span ? span : 1);
     if (!img) { perror("calloc"); exit(1); }
+    if (prefix && prefix_len) memcpy(img, prefix, prefix_len);
 
     for (int i = 0; i < g_section_count; i++) {
         InSection *s = &g_sections[i];
-        if (s->kind != kind || !s->data) continue;
+        if (s->segment != seg || !s->data) continue;   /* !data => .bss */
         if (s->merged_offset + s->size > span) {
             fprintf(stderr, "minilink: interner Fehler: Section '%s' passt nicht ins "
-                    "Gruppen-Image (0x%lx+0x%lx > 0x%lx)\n", s->name,
+                    "Segment-Image (0x%lx+0x%lx > 0x%lx)\n", s->name,
                     (unsigned long)s->merged_offset, (unsigned long)s->size,
                     (unsigned long)span);
             exit(1);
         }
         memcpy(img + s->merged_offset, s->data, s->size);
     }
-
-    fwrite(img, 1, span, out);
-    free(img);
+    return img;
 }
 
 static void write_output(const char *path, const Layout *L, uint64_t entry_addr) {
@@ -771,48 +1104,43 @@ static void write_output(const char *path, const Layout *L, uint64_t entry_addr)
     eh.e_shstrndx = SHN_UNDEF;
 
     Elf64_Phdr ph_text = {0};
-    ph_text.p_type = PT_LOAD;
-    ph_text.p_flags = PF_R | PF_X;
+    ph_text.p_type   = PT_LOAD;
+    ph_text.p_flags  = PF_R | PF_X;
     ph_text.p_offset = 0;                 /* Segment beginnt am Dateianfang (inkl. Header) */
-    ph_text.p_vaddr = g_base_addr;
-    ph_text.p_paddr = g_base_addr;
-    ph_text.p_filesz = g_page_size + L->text_size;
-    ph_text.p_memsz  = g_page_size + L->text_size;
+    ph_text.p_vaddr  = L->rx_vaddr;
+    ph_text.p_paddr  = L->rx_vaddr;
+    ph_text.p_filesz = L->rx_file_size;
+    ph_text.p_memsz  = L->rx_file_size;
     ph_text.p_align  = g_page_size;
 
-    uint64_t rw_file_offset = g_page_size + L->text_size;
-    rw_file_offset = align_up(rw_file_offset, g_page_size);
-    uint64_t rw_filesz = (L->rodata_size + L->data_size);
-
     Elf64_Phdr ph_rw = {0};
-    ph_rw.p_type = PT_LOAD;
-    ph_rw.p_flags = PF_R | PF_W;
-    ph_rw.p_offset = rw_file_offset;
-    ph_rw.p_vaddr = L->rw_segment_file_start_vaddr;
-    ph_rw.p_paddr = L->rw_segment_file_start_vaddr;
-    ph_rw.p_filesz = rw_filesz;                         /* .bss zaehlt NICHT zu filesz */
-    ph_rw.p_memsz  = rw_filesz + L->bss_size;            /* aber zu memsz -> Kernel nullt den Rest */
+    ph_rw.p_type   = PT_LOAD;
+    ph_rw.p_flags  = PF_R | PF_W;
+    ph_rw.p_offset = L->rw_file_off;
+    ph_rw.p_vaddr  = L->rw_vaddr;
+    ph_rw.p_paddr  = L->rw_vaddr;
+    ph_rw.p_filesz = L->rw_file_size;     /* .bss zaehlt NICHT zu filesz ... */
+    ph_rw.p_memsz  = L->rw_mem_size;      /* ... aber zu memsz -> Kernel nullt den Rest */
     ph_rw.p_align  = g_page_size;
 
-    fwrite(&eh, sizeof(eh), 1, out);
-    fwrite(&ph_text, sizeof(ph_text), 1, out);
-    fwrite(&ph_rw, sizeof(ph_rw), 1, out);
+    /* Header + beide Program-Header als Prefix des R-X-Segment-Images */
+    uint8_t hdr[sizeof(Elf64_Ehdr) + 2 * sizeof(Elf64_Phdr)];
+    memcpy(hdr, &eh, sizeof eh);
+    memcpy(hdr + sizeof eh, &ph_text, sizeof ph_text);
+    memcpy(hdr + sizeof eh + sizeof ph_text, &ph_rw, sizeof ph_rw);
 
-    /* Padding bis zur .text-Page-Grenze */
-    uint64_t pos = sizeof(eh) + 2 * sizeof(Elf64_Phdr);
-    while (pos < g_page_size) { fputc(0, out); pos++; }
+    uint8_t *rx = build_segment_image(0, L->rx_file_size, hdr, sizeof hdr);
+    fwrite(rx, 1, L->rx_file_size, out);
+    free(rx);
 
-    write_group_image(out, KIND_TEXT, L->text_size);
-    pos = g_page_size + L->text_size;
+    for (uint64_t pos = L->rx_file_size; pos < L->rw_file_off; pos++)
+        fputc(0, out);
 
-    while (pos < rw_file_offset) { fputc(0, out); pos++; }
-
-    /* .rodata und .data bilden EIN zusammenhaengendes RW-Image:
-       data_vaddr == rodata_vaddr + rodata_size, also schliessen die
-       beiden Gruppen-Images (je exakt ihre span-Groesse) lueckenlos
-       aneinander an. */
-    write_group_image(out, KIND_RODATA, L->rodata_size);
-    write_group_image(out, KIND_DATA,   L->data_size);
+    if (L->rw_file_size) {
+        uint8_t *rw = build_segment_image(1, L->rw_file_size, NULL, 0);
+        fwrite(rw, 1, L->rw_file_size, out);
+        free(rw);
+    }
     /* .bss wird NICHT in die Datei geschrieben (SHT_NOBITS-Prinzip) */
 
     fclose(out);
@@ -823,19 +1151,135 @@ static void write_output(const char *path, const Layout *L, uint64_t entry_addr)
  * Debug-Ausgabe: MAP-File-artige Uebersicht (siehe Dokument Abschnitt 9)
  * ------------------------------------------------------------------- */
 
-static void print_map(const Layout *L) {
-    printf("\n=== minilink MAP ===\n");
-    printf("%-20s 0x%08lx  size=0x%-8lx\n", ".text",   L->text_vaddr,   L->text_size);
-    printf("%-20s 0x%08lx  size=0x%-8lx\n", ".rodata", L->rodata_vaddr, L->rodata_size);
-    printf("%-20s 0x%08lx  size=0x%-8lx\n", ".data",   L->data_vaddr,   L->data_size);
-    printf("%-20s 0x%08lx  size=0x%-8lx  (nicht im File-Image)\n", ".bss", L->bss_vaddr, L->bss_size);
-    printf("\n%-20s %-12s %s\n", "Symbol", "Adresse", "Quelle");
-    for (int i = 0; i < g_symbol_count; i++) {
-        if (!g_symbols[i].is_defined || !g_symbols[i].is_global) continue;
-        printf("%-20s 0x%08lx    %s\n", g_symbols[i].name, g_symbols[i].final_address,
-               g_files[g_symbols[i].file_index].filename);
+static const char *kind_name(SectionKind k) {
+    switch (k) {
+        case KIND_TEXT:   return ".text";
+        case KIND_RODATA: return ".rodata";
+        case KIND_DATA:   return ".data";
+        case KIND_BSS:    return ".bss";
+        default:          return "?";
     }
-    printf("=====================\n\n");
+}
+
+/* qsort-Vergleich: definierte Symbole nach finaler Adresse */
+static int sym_addr_cmp(const void *a, const void *b) {
+    const Sym *x = &g_symbols[*(const int *)a];
+    const Sym *y = &g_symbols[*(const int *)b];
+    if (x->final_address < y->final_address) return -1;
+    if (x->final_address > y->final_address) return  1;
+    return strcmp(x->name, y->name);
+}
+
+/* qsort-Vergleich: Sektionen nach finaler virtueller Adresse */
+static int sec_addr_cmp(const void *a, const void *b) {
+    const InSection *x = &g_sections[*(const int *)a];
+    const InSection *y = &g_sections[*(const int *)b];
+    /* segment 0 liegt (per Layout) immer vor segment 1 */
+    if (x->segment != y->segment) return x->segment - y->segment;
+    if (x->merged_offset < y->merged_offset) return -1;
+    if (x->merged_offset > y->merged_offset) return  1;
+    return 0;
+}
+
+/* Schreibt die vollstaendige MAP nach `out` (stdout und/oder minilink.map).
+   entry_addr = Adresse von _start, script = "-T ..." bzw. "--lsl ...". */
+static void emit_map(FILE *out, const Layout *L, uint64_t entry_addr, const char *script) {
+    fprintf(out, "=== minilink MAP ===\n");
+    fprintf(out, "Script     : %s\n", script);
+    fprintf(out, "Entry      : _start @ 0x%08lx\n", (unsigned long)entry_addr);
+    if (g_use_lsl)
+        fprintf(out, "Layout     : BASE_ADDR=0x%08lx  PAGE_SIZE=0x%lx  RAM_BASE=0x%08lx\n",
+                (unsigned long)g_base_addr, (unsigned long)g_page_size,
+                (unsigned long)g_rw_base);
+    else
+        fprintf(out, "Layout     : BASE_ADDR=0x%08lx  PAGE_SIZE=0x%lx\n",
+                (unsigned long)g_base_addr, (unsigned long)g_page_size);
+
+    if (g_use_lsl && g_lsl_mem_n > 0) {
+        fprintf(out, "\nMemory-Regionen (LSL)\n");
+        fprintf(out, "  %-10s %-5s %-12s %10s\n", "Name", "Typ", "Adresse", "Groesse");
+        for (int i = 0; i < g_lsl_mem_n; i++)
+            fprintf(out, "  %-10s %-5s 0x%08lx %8lu K\n",
+                    g_lsl_mem[i].id, g_lsl_mem[i].is_ram ? "ram" : "rom",
+                    (unsigned long)g_lsl_mem[i].addr,
+                    (unsigned long)(g_lsl_mem[i].size >> 10));
+    }
+
+    fprintf(out, "\nSegmente (PT_LOAD)\n");
+    fprintf(out, "  %-3s %-5s %-25s %-10s %-9s %-9s\n",
+            "#", "Flags", "VirtAddr", "FileOff", "FileSz", "MemSz");
+    fprintf(out, "  %-3d %-5s 0x%08lx-0x%08lx    0x%08x 0x%07lx 0x%07lx\n",
+            0, "R-X", (unsigned long)L->rx_vaddr,
+            (unsigned long)(L->rx_vaddr + L->rx_file_size), 0u,
+            (unsigned long)L->rx_file_size, (unsigned long)L->rx_file_size);
+    fprintf(out, "  %-3d %-5s 0x%08lx-0x%08lx    0x%08lx 0x%07lx 0x%07lx\n",
+            1, "RW", (unsigned long)L->rw_vaddr,
+            (unsigned long)(L->rw_vaddr + L->rw_mem_size),
+            (unsigned long)L->rw_file_off,
+            (unsigned long)L->rw_file_size, (unsigned long)L->rw_mem_size);
+
+    fprintf(out, "\nSektionen (nach Adresse; 0-Byte-Sektionen ausgelassen)\n");
+    fprintf(out, "  %-4s %-16s %-12s %-12s %-9s %-6s %s\n",
+            "Seg", "Section", "VirtAddr", "EndAddr", "Size", "Align", "Quelle");
+    int sord[MAX_SECTIONS], sn = 0, skipped = 0;
+    for (int i = 0; i < g_section_count; i++) {
+        if (g_sections[i].size == 0) { skipped++; continue; }
+        sord[sn++] = i;
+    }
+    qsort(sord, sn, sizeof sord[0], sec_addr_cmp);
+    for (int k = 0; k < sn; k++) {
+        InSection *s = &g_sections[sord[k]];
+        uint64_t base = (s->segment == 0) ? L->rx_vaddr : L->rw_vaddr;
+        uint64_t va = base + s->merged_offset;
+        char nm[24];
+        snprintf(nm, sizeof nm, "%s%s", kind_name(s->kind),
+                 s->kind == KIND_BSS ? " (NOBITS)" : "");
+        fprintf(out, "  %-4s %-16s 0x%08lx   0x%08lx   0x%07lx %-6lu %s\n",
+                s->segment == 0 ? "R-X" : "RW", nm,
+                (unsigned long)va, (unsigned long)(va + s->size),
+                (unsigned long)s->size, (unsigned long)s->align,
+                g_files[s->file_index].filename);
+    }
+    if (skipped)
+        fprintf(out, "  (%d leere Section(s) ausgelassen)\n", skipped);
+
+    fprintf(out, "\nSymbole (definiert, nach Adresse)\n");
+    fprintf(out, "  %-12s %-6s %-4s %-10s %-22s %s\n",
+            "VirtAddr", "Bind", "Seg", "Section", "Name", "Quelle");
+    int order[MAX_SYMBOLS], n = 0;
+    for (int i = 0; i < g_symbol_count; i++)
+        if (g_symbols[i].is_defined &&
+            strncmp(g_symbols[i].name, "<section:", 9) != 0)   /* synthetische SECTION-Symbole ausblenden */
+            order[n++] = i;
+    qsort(order, n, sizeof order[0], sym_addr_cmp);
+    for (int k = 0; k < n; k++) {
+        Sym *s = &g_symbols[order[k]];
+        const char *seg = "-", *sec = "(abs)";
+        if (s->section_id >= 0) {
+            seg = g_sections[s->section_id].segment == 0 ? "R-X" : "RW";
+            sec = kind_name(g_sections[s->section_id].kind);
+        }
+        fprintf(out, "  0x%08lx   %-6s %-4s %-10s %-22s %s\n",
+                (unsigned long)s->final_address,
+                s->is_global ? "GLOBAL" : "LOCAL", seg, sec, s->name,
+                g_files[s->file_index].filename);
+    }
+    fprintf(out, "=====================\n");
+}
+
+static void print_map(const Layout *L, uint64_t entry_addr, const char *script) {
+    printf("\n");
+    emit_map(stdout, L, entry_addr, script);
+
+    FILE *mf = fopen("minilink.map", "w");
+    if (mf) {
+        emit_map(mf, L, entry_addr, script);
+        fclose(mf);
+        printf("minilink: MAP zusaetzlich geschrieben nach minilink.map\n\n");
+    } else {
+        perror("minilink.map");
+        printf("\n");
+    }
 }
 
 /* Schreibt alle geladenen Datei-Indizes samt Dateiname nach files.txt */
@@ -872,7 +1316,8 @@ static void dump_file_indices(const int *file_indices, int n_inputs) {
 
 int main(int argc, char **argv) {
     const char *output_path = NULL;
-    const char *ldl_path    = NULL;
+    const char *ldl_path    = NULL;   /* -T   : #define-Miniscript          */
+    const char *lsl_path    = NULL;   /* --lsl: vereinfachtes TASKING-LSL   */
     const char *inputs[MAX_INPUT_FILES];
     int n_inputs = 0;
 
@@ -885,6 +1330,11 @@ int main(int argc, char **argv) {
             ldl_path = argv[i];
         } else if (strncmp(argv[i], "-T", 2) == 0) {
             ldl_path = argv[i] + 2;                /* -Tscript.ldl (ohne Leerzeichen) */
+        } else if (strcmp(argv[i], "--lsl") == 0) {
+            if (++i >= argc) { fprintf(stderr, "minilink: --lsl braucht ein Argument\n"); return 1; }
+            lsl_path = argv[i];
+        } else if (strncmp(argv[i], "--lsl=", 6) == 0) {
+            lsl_path = argv[i] + 6;
         } else if (argv[i][0] == '-') {
             fprintf(stderr, "minilink: unbekannte Option '%s'\n", argv[i]);
             return 1;
@@ -898,18 +1348,25 @@ int main(int argc, char **argv) {
     }
 
     if (!output_path || n_inputs == 0) {
-        fprintf(stderr, "usage: %s -T <script.ldl> <input1.o> [input2.o ...] -o <output>\n", argv[0]);
+        fprintf(stderr,
+            "usage: %s (-T <script.ldl> | --lsl <script.lsl>) <input1.o> [...] -o <output>\n",
+            argv[0]);
         return 1;
     }
 
-    /* Layout-Parameter kommen ausschliesslich aus dem LDL-Script -- kein
-       eingebautes Default. Ohne -T geht es nicht weiter. */
-    if (!ldl_path) {
-        fprintf(stderr, "minilink: kein LDL-Script angegeben -- -T <script.ldl> mit "
-                        "#define BASE_ADDR / #define PAGE_SIZE noetig (z.B. test/default.ldl)\n");
+    /* Layout-Quelle: genau EINES von -T / --lsl. */
+    if (ldl_path && lsl_path) {
+        fprintf(stderr, "minilink: -T und --lsl schliessen sich aus\n");
         return 1;
     }
-    load_ldl_script(ldl_path);   /* validiert BASE_ADDR/PAGE_SIZE, bricht sonst ab */
+    if (!ldl_path && !lsl_path) {
+        fprintf(stderr, "minilink: kein Linkerscript angegeben -- entweder\n"
+                        "  -T <script.ldl>     (#define BASE_ADDR / PAGE_SIZE, z.B. test/default.ldl)\n"
+                        "  --lsl <script.lsl>  (vereinfachtes TASKING-LSL, z.B. test/tc27x.lsl)\n");
+        return 1;
+    }
+    if (lsl_path) load_lsl_script(lsl_path);   /* setzt g_base_addr/g_rw_base/g_page_size, g_use_lsl=1 */
+    else          load_ldl_script(ldl_path);   /* validiert BASE_ADDR/PAGE_SIZE, bricht sonst ab      */
 
     printf("minilink: linke %d Objektdatei(en) -> %s\n", n_inputs, output_path);
 
@@ -934,7 +1391,7 @@ int main(int argc, char **argv) {
     resolve_all_symbols();
 
     /* [3]/[4] Placement */
-    Layout L = place_sections();
+    Layout L = g_use_lsl ? place_sections_lsl() : place_sections_default();
     g_layout_for_reloc = L;
     assign_symbol_addresses(&L);
 
@@ -951,7 +1408,10 @@ int main(int argc, char **argv) {
     /* [6] Output */
     write_output(output_path, &L, entry_addr);
 
-    print_map(&L);
+    char script_desc[300];
+    snprintf(script_desc, sizeof script_desc, "%s %s",
+             lsl_path ? "--lsl" : "-T", lsl_path ? lsl_path : ldl_path);
+    print_map(&L, entry_addr, script_desc);
     printf("minilink: fertig. Einsprungpunkt _start @ 0x%08lx\n", entry_addr);
     return 0;
 }

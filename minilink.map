@@ -1,0 +1,41 @@
+=== minilink MAP ===
+Script     : --lsl test/tc27x.lsl
+Entry      : _start @ 0x0040101d
+Layout     : BASE_ADDR=0x00400000  PAGE_SIZE=0x1000  RAM_BASE=0x00800000
+
+Memory-Regionen (LSL)
+  Name       Typ   Adresse         Groesse
+  rom        rom   0x00400000     4096 K
+  ram        ram   0x00800000     4096 K
+  ram2       ram   0x00c00000     4096 K
+
+Segmente (PT_LOAD)
+  #   Flags VirtAddr                  FileOff    FileSz    MemSz    
+  0   R-X   0x00400000-0x004011dd    0x00000000 0x00011dd 0x00011dd
+  1   RW    0x00800000-0x00800128    0x00002000 0x0000110 0x0000128
+
+Sektionen (nach Adresse; 0-Byte-Sektionen ausgelassen)
+  Seg  Section          VirtAddr     EndAddr      Size      Align  Quelle
+  R-X  .text            0x00401000   0x0040103b   0x000003b 1      test/main.o
+  R-X  .text            0x0040103b   0x0040114e   0x0000113 1      test/msg.o
+  R-X  .rodata          0x00401150   0x004011dd   0x000008d 16     test/msg.o
+  RW   .data            0x00800000   0x00800110   0x0000110 32     test/msg.o
+  RW   .bss (NOBITS)    0x00800110   0x00800128   0x0000018 8      test/msg.o
+  (2 leere Section(s) ausgelassen)
+
+Symbole (definiert, nach Adresse)
+  VirtAddr     Bind   Seg  Section    Name                   Quelle
+  0x00401000   LOCAL  R-X  .text      sys_exit               test/main.o
+  0x0040101d   GLOBAL R-X  .text      _start                 test/main.o
+  0x0040103b   LOCAL  R-X  .text      slen                   test/msg.o
+  0x0040106a   LOCAL  R-X  .text      sys_write              test/msg.o
+  0x00401095   GLOBAL R-X  .text      print_message          test/msg.o
+  0x00401150   LOCAL  R-X  .rodata    msg                    test/msg.o
+  0x00800000   GLOBAL RW   .data      g_flags                test/msg.o
+  0x00800020   GLOBAL RW   .data      g_flags_Array          test/msg.o
+  0x00800080   GLOBAL RW   .data      g_buf64                test/msg.o
+  0x00800110   GLOBAL RW   .bss       g_call_count           test/msg.o
+  0x00800114   GLOBAL RW   .bss       g_call_count_notinit   test/msg.o
+  0x00800118   LOCAL  RW   .bss       msg2                   test/msg.o
+  0x00800120   LOCAL  RW   .bss       msg3                   test/msg.o
+=====================
