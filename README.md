@@ -39,7 +39,11 @@ dem TASKING-Linker (`ltc`) vergleicht.
 
 - Kein dynamisches Linken (nur statische Executables)
 - Keine Archiv-Unterstützung (`.a`) → keine Lazy-Symbole
-- Kein Custom-Linkerscript/LSL-Äquivalent (Layout ist fest verdrahtet)
+- Nur ein rudimentäres LDL-/Linkerscript (`-T <datei>`, **Pflicht**):
+  daraus werden ausschließlich `BASE_ADDR` und `PAGE_SIZE` gelesen —
+  keine Section-Platzierung, keine Memory-Regionen wie bei einem echten
+  LSL/GNU-ld-Script. Es gibt kein eingebautes Default-Layout; ohne `-T`
+  bricht `minilink` ab. Beispiel: `test/default.ldl`.
 - Keine Section-Garbage-Collection, kein ICF, kein LTO
 - Nur eine Handvoll Relocation-Typen (production-linker unterstützen
   dutzende, architekturabhängig)
@@ -61,7 +65,8 @@ gcc -c -ffreestanding -fno-pie -fno-stack-protector -O0 -o test/msg.o  test/msg.
 gcc -O0 -g -Wall -o build/minilink src/minilink.c
 
 # Linken mit unserem eigenen Linker (nicht mit ld!)
-./build/minilink test/main.o test/msg.o -o test/program
+# -T <script> ist Pflicht und liefert BASE_ADDR / PAGE_SIZE
+./build/minilink -T test/default.ldl test/main.o test/msg.o -o test/program
 
 # Ausführen — läuft nativ unter Linux, kein Interpreter/keine Sandbox nötig
 ./test/program
@@ -80,9 +85,12 @@ Objektdateien hinweg auf dieselbe finale Adresse zeigt).
 
 ```
 minilink/
-├── src/minilink.c      Der Linker selbst (~500 Zeilen, eine Datei)
+├── src/minilink.c      Der Linker selbst (eine Datei)
 ├── test/main.c          Testprogramm Teil 1 (_start, Aufrufer)
 ├── test/msg.c            Testprogramm Teil 2 (Definitionen, Syscalls)
+├── test/default.ldl     Minimales LDL-Script (BASE_ADDR, PAGE_SIZE)
+├── build_and_test.sh    Baut + linkt + prüft Ausgabe/Exit-Code
+├── docs/elf-aufbau.*    ELF64-Aufbau als Referenz (adoc / puml / svg)
 ├── build/minilink        Kompilierter Linker (nach Build)
 └── test/program           Vom eigenen Linker erzeugtes Executable
 ```

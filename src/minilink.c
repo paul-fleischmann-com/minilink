@@ -153,6 +153,47 @@ static void print_ehdr(const char *path, const Elf64_Ehdr *e) {
     printf("    e_shstrndx: %u\n", e->e_shstrndx);
 }
 
+/* Roh-Substring-Suche in einem Byte-Puffer (kein memmem-Zwang) */
+static int buf_contains(const uint8_t *hay, size_t hlen, const char *needle) {
+    size_t nlen = strlen(needle);
+    if (nlen == 0 || hlen < nlen) return 0;
+    for (size_t i = 0; i + nlen <= hlen; i++)
+        if (memcmp(hay + i, needle, nlen) == 0) return 1;
+    return 0;
+}
+
+/* Heuristik: wurde diese Objektdatei mit einem TASKING-Toolset erzeugt?
+ *
+ * Der ELF-Header selbst verraet den Hersteller nicht (siehe README /
+ * elf-aufbau.adoc). Belastbar in einer .o sind:
+ *   - die .comment-Section  ("TASKING VX-toolset ... C compiler", "ctc" ...)
+ *   - der DWARF-Producer-String in .debug_str / .debug_info
+ * Wir scannen diese Sections nach den bekannten Marker-Strings. Ein echter
+ * TASKING-Linkat haette zusaetzlich noch "_lc_*"-Symbole aus dem LSL.
+ */
+static int detect_tasking(const InputFile *f, const char **hit_section, const char **hit_marker) {
+    static const char *markers[] = { "TASKING", "VX-toolset", "Altium", NULL };
+
+    for (int i = 0; i < f->ehdr->e_shnum; i++) {
+        const Elf64_Shdr *sh = &f->shdrs[i];
+        if (sh->sh_type != SHT_PROGBITS) continue;
+        const char *name = f->shstrtab + sh->sh_name;
+        if (strcmp(name, ".comment") != 0 &&
+            strncmp(name, ".debug_str", 10) != 0 &&
+            strncmp(name, ".debug_info", 11) != 0)
+            continue;
+
+        const uint8_t *data = f->raw + sh->sh_offset;
+        for (int m = 0; markers[m]; m++)
+            if (buf_contains(data, sh->sh_size, markers[m])) {
+                if (hit_section) *hit_section = name;
+                if (hit_marker)  *hit_marker  = markers[m];
+                return 1;
+            }
+    }
+    return 0;
+}
+
 static int load_object_file(const char *path) {
     InputFile *f = &g_files[g_file_count];
     strncpy(f->filename, path, sizeof(f->filename) - 1);
@@ -184,6 +225,14 @@ static int load_object_file(const char *path) {
 
     f->shdrs = (Elf64_Shdr *)(f->raw + f->ehdr->e_shoff);
     f->shstrtab = (const char *)(f->raw + f->shdrs[f->ehdr->e_shstrndx].sh_offset);
+
+    /* Check: mit einem TASKING-Toolset erzeugt? (nur Hinweis, kein Abbruch) */
+    const char *tk_sec = NULL, *tk_mark = NULL;
+    if (detect_tasking(f, &tk_sec, &tk_mark))
+        printf("minilink: Hinweis: %s wurde offenbar mit einem TASKING-Toolset erzeugt "
+               "(Marker \"%s\" in Section %s)\n", path, tk_mark, tk_sec);
+    else
+        printf("minilink: %s: kein TASKING-Marker gefunden\n", path);
 
     /* Symtab- und Strtab-Section finden */
     f->symtab = NULL;
@@ -251,6 +300,15 @@ static void import_symbols(int file_index) {
     if (!f->symtab) return;
 
     for (int i = 0; i < f->symtab_count; i++) {
+        printf("  symtab[%d] name=%u (%s) info=0x%02x (bind=%u type=%u) other=0x%02x shndx=%u value=0x%lx size=%lu\n",
+               i, f->symtab[i].st_name,
+               f->strtab ? f->strtab + f->symtab[i].st_name : "",
+               f->symtab[i].st_info,
+               ELF64_ST_BIND(f->symtab[i].st_info),
+               ELF64_ST_TYPE(f->symtab[i].st_info),
+               f->symtab[i].st_other, f->symtab[i].st_shndx,
+               (unsigned long)f->symtab[i].st_value,
+               (unsigned long)f->symtab[i].st_size);
         Elf64_Sym *es = &f->symtab[i];
         int type = ELF64_ST_TYPE(es->st_info);
         int bind = ELF64_ST_BIND(es->st_info);
@@ -413,8 +471,66 @@ static void import_relocations(int file_index) {
  *   0x...     .bss      (RW, kein File-Inhalt, nur virtueller Speicher)
  * ------------------------------------------------------------------- */
 
-#define BASE_ADDR      0x400000UL
-#define PAGE_SIZE      0x1000UL
+/* Layout-Parameter. Kein eingebautes Default -- beide MUESSEN aus einem
+   LDL-Script (-T) kommen (siehe load_ldl_script()). 0 = noch nicht
+   gesetzt; main() bricht dann mit Fehlermeldung ab.
+   Ein klassisches non-PIE x86-64-Layout ist BASE_ADDR=0x400000,
+   PAGE_SIZE=0x1000 -- siehe test/default.ldl. */
+static uint64_t g_base_addr;   /* 0 = ungesetzt */
+static uint64_t g_page_size;   /* 0 = ungesetzt */
+
+/* Minimaler LDL-/Linkerscript-Reader.
+ *
+ * Erkennt Zeilen der Form
+ *     #define BASE_ADDR   0x400000UL
+ *     #define PAGE_SIZE   0x1000UL
+ * (Ganzzahl-Suffixe wie U/L/UL/ULL werden ignoriert, Basis via strtoull
+ * mit "0" -> 0x.. / 0.. / dezimal). Alle anderen Zeilen -- Leerzeilen,
+ * Kommentare, unbekannte Schluessel -- werden ueberlesen. Das ist bewusst
+ * das absolute Minimum: ein echtes LSL/Linkerscript kann Sections
+ * platzieren, Speicherbereiche definieren usw. (siehe README, Abschnitt
+ * "Was bewusst fehlt"). */
+static void load_ldl_script(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) { perror(path); exit(1); }
+
+    char line[256];
+    int lineno = 0, hits = 0;
+    while (fgets(line, sizeof(line), f)) {
+        lineno++;
+        char name[64], value[64];
+        if (sscanf(line, " #define %63s %63s", name, value) != 2)
+            continue;
+
+        /* Integer-Suffix (u/U/l/L) abschneiden */
+        for (char *p = value; *p; p++)
+            if (*p == 'u' || *p == 'U' || *p == 'l' || *p == 'L') { *p = '\0'; break; }
+        uint64_t v = strtoull(value, NULL, 0);
+
+        if (strcmp(name, "BASE_ADDR") == 0)      { g_base_addr = v; hits++; }
+        else if (strcmp(name, "PAGE_SIZE") == 0) { g_page_size = v; hits++; }
+        else
+            fprintf(stderr, "minilink: %s:%d: unbekannter Schluessel '%s' (ignoriert)\n",
+                    path, lineno, name);
+    }
+    fclose(f);
+
+    if (g_base_addr == 0) {
+        fprintf(stderr, "minilink: %s: BASE_ADDR fehlt (erwartet: #define BASE_ADDR <adresse>)\n", path);
+        exit(1);
+    }
+    if (g_page_size == 0 || (g_page_size & (g_page_size - 1)) != 0) {
+        fprintf(stderr, "minilink: %s: PAGE_SIZE (0x%lx) muss eine Zweierpotenz != 0 sein\n",
+                path, (unsigned long)g_page_size);
+        exit(1);
+    }
+    if (g_base_addr & (g_page_size - 1))
+        fprintf(stderr, "minilink: Warnung: BASE_ADDR (0x%lx) ist nicht page-aligned (PAGE_SIZE 0x%lx)\n",
+                (unsigned long)g_base_addr, (unsigned long)g_page_size);
+
+    printf("minilink: LDL-Script %s geladen (%d Wert(e): BASE_ADDR=0x%lx PAGE_SIZE=0x%lx)\n",
+           path, hits, (unsigned long)g_base_addr, (unsigned long)g_page_size);
+}
 
 static uint64_t align_up(uint64_t v, uint64_t a) {
     return (v + a - 1) & ~(a - 1);
@@ -433,7 +549,7 @@ static Layout place_sections(void) {
 
     /* Kopfbereich: ELF-Header + 1 Program-Header reservieren wir vorab
        (wird in write_output() exakt berechnet; hier grob genug fuer Alignment) */
-    uint64_t cursor = BASE_ADDR + PAGE_SIZE;   /* .text beginnt an einer Page-Grenze */
+    uint64_t cursor = g_base_addr + g_page_size;   /* .text beginnt an einer Page-Grenze */
 
     L.text_vaddr = cursor;
     for (int i = 0; i < g_section_count; i++) {
@@ -445,7 +561,7 @@ static Layout place_sections(void) {
     L.text_size = cursor - L.text_vaddr;
 
     /* Naechstes Segment (RW: .rodata + .data) beginnt an neuer Page */
-    cursor = align_up(cursor, PAGE_SIZE);
+    cursor = align_up(cursor, g_page_size);
     L.rw_segment_file_start_vaddr = cursor;
 
     L.rodata_vaddr = cursor;
@@ -617,14 +733,14 @@ static void write_output(const char *path, const Layout *L, uint64_t entry_addr)
     ph_text.p_type = PT_LOAD;
     ph_text.p_flags = PF_R | PF_X;
     ph_text.p_offset = 0;                 /* Segment beginnt am Dateianfang (inkl. Header) */
-    ph_text.p_vaddr = BASE_ADDR;
-    ph_text.p_paddr = BASE_ADDR;
-    ph_text.p_filesz = PAGE_SIZE + L->text_size;
-    ph_text.p_memsz  = PAGE_SIZE + L->text_size;
-    ph_text.p_align  = PAGE_SIZE;
+    ph_text.p_vaddr = g_base_addr;
+    ph_text.p_paddr = g_base_addr;
+    ph_text.p_filesz = g_page_size + L->text_size;
+    ph_text.p_memsz  = g_page_size + L->text_size;
+    ph_text.p_align  = g_page_size;
 
-    uint64_t rw_file_offset = PAGE_SIZE + L->text_size;
-    rw_file_offset = align_up(rw_file_offset, PAGE_SIZE);
+    uint64_t rw_file_offset = g_page_size + L->text_size;
+    rw_file_offset = align_up(rw_file_offset, g_page_size);
     uint64_t rw_filesz = (L->rodata_size + L->data_size);
 
     Elf64_Phdr ph_rw = {0};
@@ -635,7 +751,7 @@ static void write_output(const char *path, const Layout *L, uint64_t entry_addr)
     ph_rw.p_paddr = L->rw_segment_file_start_vaddr;
     ph_rw.p_filesz = rw_filesz;                         /* .bss zaehlt NICHT zu filesz */
     ph_rw.p_memsz  = rw_filesz + L->bss_size;            /* aber zu memsz -> Kernel nullt den Rest */
-    ph_rw.p_align  = PAGE_SIZE;
+    ph_rw.p_align  = g_page_size;
 
     fwrite(&eh, sizeof(eh), 1, out);
     fwrite(&ph_text, sizeof(ph_text), 1, out);
@@ -643,10 +759,10 @@ static void write_output(const char *path, const Layout *L, uint64_t entry_addr)
 
     /* Padding bis zur .text-Page-Grenze */
     uint64_t pos = sizeof(eh) + 2 * sizeof(Elf64_Phdr);
-    while (pos < PAGE_SIZE) { fputc(0, out); pos++; }
+    while (pos < g_page_size) { fputc(0, out); pos++; }
 
     write_section_group(out, KIND_TEXT);
-    pos = PAGE_SIZE + L->text_size;
+    pos = g_page_size + L->text_size;
 
     while (pos < rw_file_offset) { fputc(0, out); pos++; }
 
@@ -710,12 +826,45 @@ static void dump_file_indices(const int *file_indices, int n_inputs) {
  * ------------------------------------------------------------------- */
 
 int main(int argc, char **argv) {
-    if (argc < 4 || strcmp(argv[argc-2], "-o") != 0) {
-        fprintf(stderr, "usage: %s <input1.o> [input2.o ...] -o <output>\n", argv[0]);
+    const char *output_path = NULL;
+    const char *ldl_path    = NULL;
+    const char *inputs[MAX_INPUT_FILES];
+    int n_inputs = 0;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-o") == 0) {
+            if (++i >= argc) { fprintf(stderr, "minilink: -o braucht ein Argument\n"); return 1; }
+            output_path = argv[i];
+        } else if (strcmp(argv[i], "-T") == 0) {
+            if (++i >= argc) { fprintf(stderr, "minilink: -T braucht ein Argument\n"); return 1; }
+            ldl_path = argv[i];
+        } else if (strncmp(argv[i], "-T", 2) == 0) {
+            ldl_path = argv[i] + 2;                /* -Tscript.ldl (ohne Leerzeichen) */
+        } else if (argv[i][0] == '-') {
+            fprintf(stderr, "minilink: unbekannte Option '%s'\n", argv[i]);
+            return 1;
+        } else {
+            if (n_inputs >= MAX_INPUT_FILES) {
+                fprintf(stderr, "minilink: zu viele Eingabedateien (max %d)\n", MAX_INPUT_FILES);
+                return 1;
+            }
+            inputs[n_inputs++] = argv[i];
+        }
+    }
+
+    if (!output_path || n_inputs == 0) {
+        fprintf(stderr, "usage: %s -T <script.ldl> <input1.o> [input2.o ...] -o <output>\n", argv[0]);
         return 1;
     }
-    const char *output_path = argv[argc - 1];
-    int n_inputs = argc - 3;
+
+    /* Layout-Parameter kommen ausschliesslich aus dem LDL-Script -- kein
+       eingebautes Default. Ohne -T geht es nicht weiter. */
+    if (!ldl_path) {
+        fprintf(stderr, "minilink: kein LDL-Script angegeben -- -T <script.ldl> mit "
+                        "#define BASE_ADDR / #define PAGE_SIZE noetig (z.B. test/default.ldl)\n");
+        return 1;
+    }
+    load_ldl_script(ldl_path);   /* validiert BASE_ADDR/PAGE_SIZE, bricht sonst ab */
 
     printf("minilink: linke %d Objektdatei(en) -> %s\n", n_inputs, output_path);
 
@@ -723,7 +872,7 @@ int main(int argc, char **argv) {
     int file_indices[MAX_INPUT_FILES];
     for (int i = 0; i < n_inputs; i++)
     {
-      file_indices[i] = load_object_file(argv[1 + i]);
+      file_indices[i] = load_object_file(inputs[i]);
     }
 
     dump_files(file_indices, n_inputs);

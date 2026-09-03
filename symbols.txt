@@ -1,4 +1,4 @@
-# minilink Symboltabelle (13 Eintraege, vor Placement)
+# minilink Symboltabelle (19 Eintraege, vor Placement)
 # Name                             Bindung   Status  Section            Offset           Quelldatei
   <section:.text>                  LOCAL     DEF     .text              0x00000000000000   test/main.o
   sys_exit                         LOCAL     DEF     .text              0x00000000000000   test/main.o
@@ -6,10 +6,16 @@
   print_message                    GLOBAL    UNDEF   -                  0x00000000000000   test/main.o
   g_call_count                     GLOBAL    UNDEF   -                  0x00000000000000   test/main.o
   <section:.text>                  LOCAL     DEF     .text              0x00000000000000   test/msg.o
+  <section:.bss>                   LOCAL     DEF     .bss               0x00000000000000   test/msg.o
   <section:.rodata>                LOCAL     DEF     .rodata            0x00000000000000   test/msg.o
   msg                              LOCAL     DEF     .rodata            0x00000000000000   test/msg.o
-  sys_write                        LOCAL     DEF     .text              0x00000000000000   test/msg.o
+  msg2                             LOCAL     DEF     .bss               0x00000000000008   test/msg.o
+  msg3                             LOCAL     DEF     .bss               0x00000000000010   test/msg.o
+  slen                             LOCAL     DEF     .text              0x00000000000000   test/msg.o
+  sys_write                        LOCAL     DEF     .text              0x0000000000002f   test/msg.o
   g_call_count                     GLOBAL    DEF     .bss               0x00000000000000   test/msg.o
   g_call_count_notinit             GLOBAL    DEF     .bss               0x00000000000004   test/msg.o
   g_flags                          GLOBAL    DEF     .data              0x00000000000000   test/msg.o
-  print_message                    GLOBAL    DEF     .text              0x0000000000002b   test/msg.o
+  g_flags_Array                    GLOBAL    DEF     .data              0x00000000000020   test/msg.o
+  g_buf64                          GLOBAL    DEF     .data              0x00000000000080   test/msg.o
+  print_message                    GLOBAL    DEF     .text              0x0000000000005a   test/msg.o

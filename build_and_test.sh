@@ -21,7 +21,7 @@ mkdir -p build
 "$CC" -O0 -g -Wall -o build/minilink src/minilink.c
 
 echo "==> [3/5] Linken mit minilink (nicht mit ld!)"
-./build/minilink test/main.o test/msg.o -o test/program
+./build/minilink -T test/default.ldl test/main.o test/msg.o -o test/program
 
 echo "==> [4/5] Erzeugtes Executable ausfuehren"
 set +e
@@ -30,7 +30,11 @@ ACTUAL_RC=$?
 set -e
 
 EXPECTED_OUT="Hello from mini-linker!
-Hello from mini-linker!"
+Hello from mini-linker 2 Hello from mini-linker 2 !
+Hello from mini-linker 2 Hello from mini-linker 3 !
+Hello from mini-linker!
+Hello from mini-linker 2 Hello from mini-linker 2 !
+Hello from mini-linker 2 Hello from mini-linker 3 !"
 EXPECTED_RC=2
 
 echo "==> [5/5] Ergebnis pruefen"

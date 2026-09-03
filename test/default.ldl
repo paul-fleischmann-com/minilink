@@ -1,0 +1,14 @@
+/*
+ * default.ldl -- minimales LDL-/Linkerscript fuer minilink.
+ *
+ * minilink liest daraus nur die beiden Layout-Parameter (-T <datei>):
+ *   BASE_ADDR : virtuelle Basisadresse des ersten (R-X) Segments
+ *   PAGE_SIZE : Ausrichtung / Segment-Granularitaet (Zweierpotenz)
+ *
+ * Alles andere (Kommentare, Leerzeilen, unbekannte Schluessel) wird
+ * ueberlesen. Zahlenformat: 0x.. hex, 0.. oktal, sonst dezimal;
+ * Suffixe U/L/UL/ULL sind erlaubt.
+ */
+
+#define BASE_ADDR   0x400000UL
+#define PAGE_SIZE   0x1000UL
