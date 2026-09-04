@@ -1,42 +1,35 @@
 === minilink MAP ===
-Script     : --lsl test/tc27x.lsl
+Script     : -T test/default.ldl
 Entry      : _start @ 0x0040101d
 Layout     : BASE_ADDR=0x00400000  PAGE_SIZE=0x1000
 
-Memory-Regionen (LSL)
-  Name       Typ   Adresse         Groesse  genutzt
-  rom        rom   0x00400000     4096 K  ja
-  ram        ram   0x00800000     4096 K  ja
-  ram2       ram   0x00c00000     4096 K  ja
-
 Segmente (PT_LOAD)
   #   Flags VirtAddr     EndAddr      FileOff    FileSz    MemSz     Region
-  0   R-X   0x00400000   0x004011dd   0x00000000 0x00011dd 0x00011dd rom
-  1   RW    0x00800000   0x00800110   0x00002000 0x0000110 0x0000110 ram
-  2   RW    0x00c00000   0x00c00018   0x00003000 0x0000000 0x0000018 ram2
+  0   R-X   0x00400000   0x0040114e   0x00000000 0x000114e 0x000114e -
+  1   RW    0x00402000   0x004021c8   0x00002000 0x00001b0 0x00001c8 -
 
 Sektionen (nach Adresse; 0-Byte-Sektionen ausgelassen)
   Seg  Section          VirtAddr     EndAddr      Size      Align  Quelle
-  R-X  .text            0x00401000   0x0040103b   0x000003b 1      test/main.o
-  R-X  .text            0x0040103b   0x0040114e   0x0000113 1      test/msg.o
-  R-X  .rodata          0x00401150   0x004011dd   0x000008d 16     test/msg.o
-  RW   .data            0x00800000   0x00800110   0x0000110 32     test/msg.o
-  RW   .bss (NOBITS)    0x00c00000   0x00c00018   0x0000018 8      test/msg.o
+  R-X  .text            0x00401000   0x0040103b   0x000003b 1      test/g/main.o
+  R-X  .text            0x0040103b   0x0040114e   0x0000113 1      test/g/msg.o
+  RW   .rodata          0x00402000   0x0040208d   0x000008d 16     test/g/msg.o
+  RW   .data            0x004020a0   0x004021b0   0x0000110 32     test/g/msg.o
+  RW   .bss (NOBITS)    0x004021b0   0x004021c8   0x0000018 8      test/g/msg.o
   (2 leere Section(s) ausgelassen)
 
 Symbole (definiert, nach Adresse)
   VirtAddr     Bind   Seg  Section    Name                   Quelle
-  0x00401000   LOCAL  R-X  .text      sys_exit               test/main.o
-  0x0040101d   GLOBAL R-X  .text      _start                 test/main.o
-  0x0040103b   LOCAL  R-X  .text      slen                   test/msg.o
-  0x0040106a   LOCAL  R-X  .text      sys_write              test/msg.o
-  0x00401095   GLOBAL R-X  .text      print_message          test/msg.o
-  0x00401150   LOCAL  R-X  .rodata    msg                    test/msg.o
-  0x00800000   GLOBAL RW   .data      g_flags                test/msg.o
-  0x00800020   GLOBAL RW   .data      g_flags_Array          test/msg.o
-  0x00800080   GLOBAL RW   .data      g_buf64                test/msg.o
-  0x00c00000   GLOBAL RW   .bss       g_call_count           test/msg.o
-  0x00c00004   GLOBAL RW   .bss       g_call_count_notinit   test/msg.o
-  0x00c00008   LOCAL  RW   .bss       msg2                   test/msg.o
-  0x00c00010   LOCAL  RW   .bss       msg3                   test/msg.o
+  0x00401000   LOCAL  R-X  .text      sys_exit               test/g/main.o
+  0x0040101d   GLOBAL R-X  .text      _start                 test/g/main.o
+  0x0040103b   LOCAL  R-X  .text      slen                   test/g/msg.o
+  0x0040106a   LOCAL  R-X  .text      sys_write              test/g/msg.o
+  0x00401095   GLOBAL R-X  .text      print_message          test/g/msg.o
+  0x00402000   LOCAL  RW   .rodata    msg                    test/g/msg.o
+  0x004020a0   GLOBAL RW   .data      g_flags                test/g/msg.o
+  0x004020c0   GLOBAL RW   .data      g_flags_Array          test/g/msg.o
+  0x00402120   GLOBAL RW   .data      g_buf64                test/g/msg.o
+  0x004021b0   GLOBAL RW   .bss       g_call_count           test/g/msg.o
+  0x004021b4   GLOBAL RW   .bss       g_call_count_notinit   test/g/msg.o
+  0x004021b8   LOCAL  RW   .bss       msg2                   test/g/msg.o
+  0x004021c0   LOCAL  RW   .bss       msg3                   test/g/msg.o
 =====================

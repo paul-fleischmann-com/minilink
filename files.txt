@@ -1,4 +1,4 @@
 # minilink: 2 Eingabedatei(en)
 # file_index Dateiname
-  0          test/main.o
-  1          test/msg.o
+  0          test/g/main.o
+  1          test/g/msg.o

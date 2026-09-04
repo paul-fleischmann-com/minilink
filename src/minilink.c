@@ -58,8 +58,9 @@ typedef struct {
     char     name[128];
     int      file_index;
     int      orig_symidx;
-    int      section_id;       /* Index in g_sections, -1 wenn undefiniert/extern */
-    uint64_t value;            /* Offset innerhalb der Section (vor Placement) */
+    int      section_id;       /* Index in g_sections, -1 wenn undefiniert/extern    */
+    int      keep_id;          /* Index in g_keep (nur --debug), sonst -1            */
+    uint64_t value;            /* Offset innerhalb der Section (vor Placement)       */
     int      is_global;
     int      is_defined;       /* 1 = definiert (auch wenn lokal) */
     uint64_t final_address;    /* erst nach Placement gueltig */
@@ -67,12 +68,28 @@ typedef struct {
 } Sym;
 
 typedef struct {
-    int      section_id;       /* welche InSection enthaelt diese Relocation */
-    uint64_t offset;           /* Offset innerhalb der Section */
+    int      section_id;       /* Ziel-InSection, -1 wenn Ziel eine keep-Section ist */
+    int      keep_id;          /* Ziel g_keep-Index (nur --debug), sonst -1          */
+    uint64_t keep_base;        /* Startoffset des Datei-Chunks in g_keep[keep_id]    */
+    uint64_t offset;           /* Offset der Patch-Stelle innerhalb der Datei-Section*/
     int      sym_index;        /* Index in g_symbols */
     uint32_t type;             /* R_X86_64_* */
     int64_t  addend;
 } Reloc;
+
+/* --debug: nicht ladbare Sections (.debug_*), die wir 1:1 durchreichen,
+   ueber alle Eingabedateien konkateniert. */
+#define MAX_KEEP 32
+typedef struct {
+    char     name[64];
+    uint32_t sh_type;
+    uint64_t align;
+    uint8_t *data;
+    size_t   size, cap;
+    uint64_t chunk_off[MAX_INPUT_FILES];   /* Start des jew. Datei-Chunks in data[] */
+    int      chunk_present[MAX_INPUT_FILES];
+    int      sht_index;                    /* Index in der Output-Section-Header-Tab. */
+} KeepSec;
 
 typedef struct {
     char      filename[256];
@@ -98,6 +115,13 @@ static int       g_symbol_count = 0;
 static Reloc     g_relocs[MAX_RELOCS];
 static int       g_reloc_count = 0;
 
+static KeepSec   g_keep[MAX_KEEP];
+static int       g_keep_n = 0;
+static int       g_debug_mode = 0;          /* --debug: Debug-Info behalten */
+
+/* file-section-index -> g_keep-Index (nur --debug), sonst -1 */
+static int       keep_map[MAX_INPUT_FILES][MAX_SECTIONS];
+
 /* ---------------------------------------------------------------------
  * Hilfsfunktionen: Section-Klassifikation ("select"-Aequivalent aus
  * Abschnitt 6 des Dokuments -- hier fest verdrahtet statt per Wildcard,
@@ -110,6 +134,16 @@ static SectionKind classify_section(const char *name) {
     if (strncmp(name, ".data", 5) == 0)   return KIND_DATA;
     if (strncmp(name, ".bss", 4) == 0)    return KIND_BSS;
     return KIND_IGNORED;   /* .eh_frame, .comment, .note.*, Debug-Sections, ... */
+}
+
+static const char *kind_name(SectionKind k) {
+    switch (k) {
+        case KIND_TEXT:   return ".text";
+        case KIND_RODATA: return ".rodata";
+        case KIND_DATA:   return ".data";
+        case KIND_BSS:    return ".bss";
+        default:          return "?";
+    }
 }
 
 /* ---------------------------------------------------------------------
@@ -259,14 +293,66 @@ static int load_object_file(const char *path) {
 /* Section-Header-Index dieser Datei -> Index in unserem globalen g_sections-Array */
 static int shndx_map[MAX_INPUT_FILES][MAX_SECTIONS];
 
+/* Haengt den Section-Inhalt an die passende g_keep-Section an (--debug) und
+   merkt sich den Chunk-Offset dieser Datei. Legt die keep-Section bei
+   Bedarf an. Gibt den g_keep-Index zurueck. */
+static int keep_append(int file_index, const char *name, const Elf64_Shdr *sh,
+                       const uint8_t *bytes) {
+    int ki = -1;
+    for (int j = 0; j < g_keep_n; j++)
+        if (strcmp(g_keep[j].name, name) == 0) { ki = j; break; }
+    if (ki < 0) {
+        if (g_keep_n >= MAX_KEEP) {
+            fprintf(stderr, "minilink: --debug: zu viele keep-Sections (%s)\n", name);
+            exit(1);
+        }
+        ki = g_keep_n++;
+        memset(&g_keep[ki], 0, sizeof g_keep[ki]);
+        strncpy(g_keep[ki].name, name, sizeof g_keep[ki].name - 1);
+        g_keep[ki].sh_type = sh->sh_type;
+        g_keep[ki].align   = sh->sh_addralign ? sh->sh_addralign : 1;
+    }
+    KeepSec *k = &g_keep[ki];
+    if (sh->sh_addralign > k->align) k->align = sh->sh_addralign;
+
+    uint64_t a = k->align ? k->align : 1;
+    size_t base = (k->size + a - 1) & ~(size_t)(a - 1);
+    size_t need = base + sh->sh_size;
+    if (need > k->cap) {
+        size_t nc = k->cap ? k->cap : 4096;
+        while (nc < need) nc *= 2;
+        k->data = realloc(k->data, nc);
+        if (!k->data) { perror("realloc"); exit(1); }
+        k->cap = nc;
+    }
+    if (base > k->size) memset(k->data + k->size, 0, base - k->size);
+    memcpy(k->data + base, bytes, sh->sh_size);
+    k->chunk_off[file_index]     = base;
+    k->chunk_present[file_index] = 1;
+    k->size = need;
+    return ki;
+}
+
 static void import_sections(int file_index) {
     InputFile *f = &g_files[file_index];
-    for (int i = 0; i < f->ehdr->e_shnum; i++) shndx_map[file_index][i] = -1;
+    for (int i = 0; i < f->ehdr->e_shnum; i++) {
+        shndx_map[file_index][i] = -1;
+        keep_map[file_index][i]  = -1;
+    }
 
     for (int i = 0; i < f->ehdr->e_shnum; i++) {
         Elf64_Shdr *sh = &f->shdrs[i];
         const char *name = f->shstrtab + sh->sh_name;
         SectionKind kind = classify_section(name);
+
+        /* --debug: .debug_*-Sections behalten (nicht ladbar -> nicht in g_sections) */
+        if (g_debug_mode && kind == KIND_IGNORED &&
+            sh->sh_type == SHT_PROGBITS && strncmp(name, ".debug", 6) == 0) {
+            keep_map[file_index][i] =
+                keep_append(file_index, name, sh, f->raw + sh->sh_offset);
+            continue;
+        }
+
         if (kind == KIND_IGNORED) continue;
         if (sh->sh_type != SHT_PROGBITS && sh->sh_type != SHT_NOBITS) continue;
         if (!(sh->sh_flags & SHF_ALLOC)) continue;   /* keine Loader-relevante Section */
@@ -319,10 +405,14 @@ static void import_symbols(int file_index) {
         const char *raw_name = f->strtab + es->st_name;
         char synth_name[80];  /* "<section:" + name[64] + ">" + '\0' */
         const char *name = raw_name;
+        int sec_id  = -1;
+        int keep_id = -1;
         if (type == STT_SECTION) {
-            int target_id = shndx_map[file_index][es->st_shndx];
-            snprintf(synth_name, sizeof(synth_name), "<section:%s>",
-                     target_id >= 0 ? g_sections[target_id].name : "?");
+            sec_id  = shndx_map[file_index][es->st_shndx];
+            keep_id = keep_map[file_index][es->st_shndx];
+            const char *tn = sec_id  >= 0 ? g_sections[sec_id].name
+                           : keep_id >= 0 ? g_keep[keep_id].name : "?";
+            snprintf(synth_name, sizeof(synth_name), "<section:%s>", tn);
             name = synth_name;
         } else if (!raw_name[0]) {
             continue;
@@ -345,7 +435,9 @@ static void import_symbols(int file_index) {
             strncpy(s->name, name, sizeof(s->name) - 1);
             s->file_index = file_index;
             s->orig_symidx = i;
-            s->section_id = shndx_map[file_index][es->st_shndx];
+            s->section_id = (type == STT_SECTION) ? sec_id
+                                                  : shndx_map[file_index][es->st_shndx];
+            s->keep_id = (type == STT_SECTION) ? keep_id : -1;
             s->value = es->st_value;
             s->is_global = (bind == STB_GLOBAL);
             s->is_defined = 1;
@@ -358,6 +450,7 @@ static void import_symbols(int file_index) {
             s->file_index = file_index;
             s->orig_symidx = i;
             s->section_id = -1;
+            s->keep_id = -1;
             s->value = 0;
             s->is_global = 1;
             s->is_defined = 0;
@@ -434,7 +527,9 @@ static void import_relocations(int file_index) {
 
         int target_shndx = sh->sh_info;   /* Section, auf die sich diese Relocations beziehen */
         int target_section_id = shndx_map[file_index][target_shndx];
-        if (target_section_id < 0) continue;   /* Ziel-Section wurde ignoriert (z.B. .eh_frame) */
+        int target_keep_id    = keep_map[file_index][target_shndx];   /* -1 ohne --debug */
+        if (target_section_id < 0 && target_keep_id < 0)
+            continue;   /* Ziel-Section wurde verworfen (z.B. .eh_frame) */
 
         Elf64_Rela *relas = (Elf64_Rela *)(f->raw + sh->sh_offset);
         int count = sh->sh_size / sizeof(Elf64_Rela);
@@ -446,8 +541,15 @@ static void import_relocations(int file_index) {
                 fprintf(stderr, "minilink: interner Fehler: Relocation-Symbol nicht gefunden\n");
                 exit(1);
             }
+            if (g_reloc_count >= MAX_RELOCS) {
+                fprintf(stderr, "minilink: zu viele Relocations (max %d)\n", MAX_RELOCS);
+                exit(1);
+            }
             Reloc *rel = &g_relocs[g_reloc_count++];
             rel->section_id = target_section_id;
+            rel->keep_id    = target_keep_id;
+            rel->keep_base  = (target_keep_id >= 0)
+                              ? g_keep[target_keep_id].chunk_off[file_index] : 0;
             rel->offset = relas[r].r_offset;
             rel->sym_index = sym_index;
             rel->type = ELF64_R_TYPE(relas[r].r_info);
@@ -1023,6 +1125,15 @@ static void assign_symbol_addresses(const Layout *L) {
     for (int i = 0; i < g_symbol_count; i++) {
         Sym *s = &g_symbols[i];
         if (!s->is_defined) continue;
+
+        /* SECTION-Symbol einer behaltenen .debug_*-Section: "Adresse" ist
+           section-relativ = Chunk-Offset dieser Datei im gemergten Puffer.
+           DWARF-Relocations rechnen S + Addend -> korrekter Merge-Offset. */
+        if (s->keep_id >= 0) {
+            s->final_address = g_keep[s->keep_id].chunk_off[s->file_index] + s->value;
+            s->resolved = 1;
+            continue;
+        }
         if (s->section_id < 0) { s->resolved = 1; s->final_address = 0; continue; } /* abs. Symbol, hier ungenutzt */
 
         InSection *sec = &g_sections[s->section_id];
@@ -1050,23 +1161,29 @@ static Layout g_layout_for_reloc;   /* vom Driver vor apply_relocations() gesetz
 static void apply_relocations(void) {
     for (int i = 0; i < g_reloc_count; i++) {
         Reloc *r = &g_relocs[i];
-        InSection *sec = &g_sections[r->section_id];
-        if (sec->kind == KIND_BSS) continue;  /* .bss hat keinen File-Inhalt zum Patchen */
 
         Sym *sym = &g_symbols[r->sym_index];
-        uint64_t S = sym->final_address;   /* Symbolwert (finale Adresse) */
+        uint64_t S = sym->final_address;   /* Symbolwert (finale Adresse bzw. Merge-Offset) */
         int64_t  A = r->addend;            /* konstanter Offset aus der Relocation */
 
-        /* P = finale virtuelle Adresse der Patch-Stelle selbst
-           (Segment-Basis + Offset der Section im Segment + lokaler Offset) */
-        uint64_t P = g_layout_for_reloc.seg[sec->seg_index].vaddr
-                   + sec->merged_offset + r->offset;
+        uint8_t *patch_loc;
+        uint64_t P;                        /* nur fuer PC-relative Typen relevant */
 
-        /* sec->data enthaelt die rohen Bytes genau dieser einen InSection;
-           r->offset ist relativ dazu (kein zusaetzlicher Merge-Offset noetig,
-           da wir hier direkt in die Quellbytes patchen, bevor sie im
-           Output-Writer an ihre Merge-Position kopiert werden). */
-        uint8_t *patch_loc = sec->data + r->offset;
+        if (r->keep_id >= 0) {
+            /* Ziel ist eine behaltene .debug_*-Section (--debug): direkt in
+               den gemergten keep-Puffer patchen. DWARF nutzt hier nur
+               R_X86_64_32/32S/64 -- kein PC-relativer Bezug. */
+            patch_loc = g_keep[r->keep_id].data + r->keep_base + r->offset;
+            P = 0;
+        } else {
+            InSection *sec = &g_sections[r->section_id];
+            if (sec->kind == KIND_BSS) continue;  /* .bss hat keinen File-Inhalt */
+            /* sec->data enthaelt die rohen Bytes genau dieser InSection;
+               r->offset ist relativ dazu. */
+            patch_loc = sec->data + r->offset;
+            P = g_layout_for_reloc.seg[sec->seg_index].vaddr
+              + sec->merged_offset + r->offset;
+        }
 
         switch (r->type) {
             case R_X86_64_PC32:
@@ -1133,6 +1250,26 @@ static uint8_t *build_segment_image(int seg, uint64_t span,
     return img;
 }
 
+/* Fuegt name (falls noch nicht vorhanden) an eine Stringtabelle an und
+   gibt den Offset zurueck. buf[0] ist stets '\0'. */
+static uint32_t strtab_add(char *buf, size_t *len, const char *name) {
+    for (size_t p = 0; p < *len; p += strlen(buf + p) + 1)
+        if (strcmp(buf + p, name) == 0) return (uint32_t)p;
+    uint32_t at = (uint32_t)*len;
+    size_t n = strlen(name) + 1;
+    memcpy(buf + *len, name, n);
+    *len += n;
+    return at;
+}
+
+/* --- Output-Section-Tabelle (nur --debug) ------------------------------ */
+typedef struct {
+    char     name[64];
+    uint32_t sh_type, sh_flags_lo;
+    uint64_t addr, off, size, align, entsize;
+    uint32_t link, info;
+} OShdr;
+
 static void write_output(const char *path, const Layout *L, uint64_t entry_addr) {
     FILE *out = fopen(path, "wb");
     if (!out) { perror(path); exit(1); }
@@ -1148,7 +1285,7 @@ static void write_output(const char *path, const Layout *L, uint64_t entry_addr)
     eh.e_version = EV_CURRENT;
     eh.e_entry = entry_addr;
     eh.e_phoff = sizeof(Elf64_Ehdr);
-    eh.e_shoff = 0;               /* keine Section-Header noetig, um das Binary auszufuehren */
+    eh.e_shoff = 0;               /* ohne --debug: keine Section-Header */
     eh.e_ehsize = sizeof(Elf64_Ehdr);
     eh.e_phentsize = sizeof(Elf64_Phdr);
     eh.e_phnum = (uint16_t)L->n_seg;
@@ -1191,6 +1328,155 @@ static void write_output(const char *path, const Layout *L, uint64_t entry_addr)
     }
     /* .bss wird NICHT in die Datei geschrieben (SHT_NOBITS-Prinzip) */
 
+    if (!g_debug_mode) {
+        fclose(out);
+        chmod(path, 0755);
+        return;
+    }
+
+    /* ---- --debug: Section-Header-Tabelle + .debug_* + .symtab/.strtab -- */
+    OShdr osec[4 + MAX_KEEP + 3];   /* NULL + (kind,seg) + keeps + symtab/strtab/shstrtab */
+    int   n_osec = 0;
+    int   sec_sht[MAX_SECTIONS];    /* g_sections-Index -> osec/SHT-Index */
+    for (int i = 0; i < g_section_count; i++) sec_sht[i] = 0;
+
+    osec[n_osec++] = (OShdr){0};    /* [0] SHT_NULL */
+
+    /* je (kind, segment) eine Output-Section aus den zusammenhaengend
+       platzierten InSections */
+    const SectionKind kinds[4] = { KIND_TEXT, KIND_RODATA, KIND_DATA, KIND_BSS };
+    for (int seg = 0; seg < L->n_seg; seg++)
+        for (int ki = 0; ki < 4; ki++) {
+            SectionKind kd = kinds[ki];
+            int any = 0; uint64_t lo = 0, hi = 0, al = 1;
+            for (int i = 0; i < g_section_count; i++) {
+                InSection *s = &g_sections[i];
+                if (s->seg_index != seg || s->kind != kd) continue;
+                if (!any || s->merged_offset < lo) lo = s->merged_offset;
+                if (!any || s->merged_offset + s->size > hi) hi = s->merged_offset + s->size;
+                if (s->align > al) al = s->align;
+                any = 1;
+            }
+            if (!any) continue;
+            OShdr *o = &osec[n_osec];
+            strncpy(o->name, kind_name(kd), sizeof o->name - 1);
+            o->sh_type = (kd == KIND_BSS) ? SHT_NOBITS : SHT_PROGBITS;
+            o->sh_flags_lo = SHF_ALLOC |
+                (kd == KIND_TEXT ? SHF_EXECINSTR : 0) |
+                (kd == KIND_DATA || kd == KIND_BSS ? SHF_WRITE : 0);
+            o->addr  = L->seg[seg].vaddr    + lo;
+            o->off   = L->seg[seg].file_off + lo;
+            o->size  = hi - lo;
+            o->align = al;
+            for (int i = 0; i < g_section_count; i++)
+                if (g_sections[i].seg_index == seg && g_sections[i].kind == kd)
+                    sec_sht[i] = n_osec;
+            n_osec++;
+        }
+
+    /* .debug_*-Sections hinter die Segmente schreiben */
+    for (int j = 0; j < g_keep_n; j++) {
+        KeepSec *k = &g_keep[j];
+        uint64_t a = k->align ? k->align : 1;
+        while (written % a) { fputc(0, out); written++; }
+        fwrite(k->data, 1, k->size, out);
+        OShdr *o = &osec[n_osec];
+        strncpy(o->name, k->name, sizeof o->name - 1);
+        o->sh_type = k->sh_type;
+        o->addr = 0; o->off = written; o->size = k->size; o->align = a;
+        k->sht_index = n_osec;
+        n_osec++;
+        written += k->size;
+    }
+
+    /* .strtab + .symtab: alle definierten Programm-Symbole (keine
+       synthetischen <section:*>), lokale vor globalen. */
+    static char strtab[1 << 16];  size_t strtab_len = 1; strtab[0] = '\0';
+    static Elf64_Sym syms[MAX_SYMBOLS + 1];
+    int nsym = 1;                  /* [0] = STN_UNDEF */
+    memset(&syms[0], 0, sizeof syms[0]);
+    int first_global = -1;
+    for (int pass = 0; pass < 2; pass++) {     /* 0 = lokal, 1 = global */
+        for (int i = 0; i < g_symbol_count; i++) {
+            Sym *s = &g_symbols[i];
+            if (!s->is_defined || s->section_id < 0) continue;
+            if (strncmp(s->name, "<section:", 9) == 0) continue;
+            if ((pass == 0) == (s->is_global != 0)) continue;
+            if (pass == 1 && first_global < 0) first_global = nsym;
+            Elf64_Sym *o = &syms[nsym++];
+            memset(o, 0, sizeof *o);
+            o->st_name  = strtab_add(strtab, &strtab_len, s->name);
+            o->st_value = s->final_address;
+            int stt = (g_sections[s->section_id].kind == KIND_TEXT) ? STT_FUNC : STT_OBJECT;
+            o->st_info  = (unsigned char)ELF64_ST_INFO(s->is_global ? STB_GLOBAL : STB_LOCAL, stt);
+            o->st_shndx = (uint16_t)sec_sht[s->section_id];
+        }
+    }
+    if (first_global < 0) first_global = nsym;
+
+    while (written % 8) { fputc(0, out); written++; }
+    uint64_t symtab_off = written;
+    fwrite(syms, sizeof(Elf64_Sym), nsym, out);
+    written += (uint64_t)nsym * sizeof(Elf64_Sym);
+
+    uint64_t strtab_off = written;
+    fwrite(strtab, 1, strtab_len, out);
+    written += strtab_len;
+
+    int idx_symtab = n_osec++;
+    int idx_strtab = n_osec++;
+    int idx_shstr  = n_osec++;
+
+    /* .shstrtab: alle bisher vergebenen Section-Namen + die drei folgenden */
+    static char shstr[1 << 14];  size_t shstr_len = 1; shstr[0] = '\0';
+    uint32_t name_off[4 + MAX_KEEP + 3];
+    for (int i = 1; i < idx_symtab; i++)
+        name_off[i] = strtab_add(shstr, &shstr_len, osec[i].name);
+    name_off[idx_symtab] = strtab_add(shstr, &shstr_len, ".symtab");
+    name_off[idx_strtab] = strtab_add(shstr, &shstr_len, ".strtab");
+    name_off[idx_shstr]  = strtab_add(shstr, &shstr_len, ".shstrtab");
+
+    uint64_t shstr_off = written;
+    fwrite(shstr, 1, shstr_len, out);
+    written += shstr_len;
+
+    /* SHT selbst */
+    while (written % 8) { fputc(0, out); written++; }
+    uint64_t sht_off = written;
+
+    for (int i = 0; i < n_osec; i++) {
+        Elf64_Shdr sh; memset(&sh, 0, sizeof sh);
+        if (i == 0) { fwrite(&sh, sizeof sh, 1, out); continue; }
+        if (i == idx_symtab) {
+            sh.sh_name = name_off[i]; sh.sh_type = SHT_SYMTAB;
+            sh.sh_offset = symtab_off; sh.sh_size = (uint64_t)nsym * sizeof(Elf64_Sym);
+            sh.sh_link = (uint32_t)idx_strtab; sh.sh_info = (uint32_t)first_global;
+            sh.sh_addralign = 8; sh.sh_entsize = sizeof(Elf64_Sym);
+        } else if (i == idx_strtab) {
+            sh.sh_name = name_off[i]; sh.sh_type = SHT_STRTAB;
+            sh.sh_offset = strtab_off; sh.sh_size = strtab_len; sh.sh_addralign = 1;
+        } else if (i == idx_shstr) {
+            sh.sh_name = name_off[i]; sh.sh_type = SHT_STRTAB;
+            sh.sh_offset = shstr_off; sh.sh_size = shstr_len; sh.sh_addralign = 1;
+        } else {
+            OShdr *o = &osec[i];
+            sh.sh_name = name_off[i]; sh.sh_type = o->sh_type;
+            sh.sh_flags = o->sh_flags_lo;
+            sh.sh_addr = o->addr; sh.sh_offset = o->off; sh.sh_size = o->size;
+            sh.sh_addralign = o->align; sh.sh_entsize = o->entsize;
+            sh.sh_link = o->link; sh.sh_info = o->info;
+        }
+        fwrite(&sh, sizeof sh, 1, out);
+    }
+
+    /* ELF-Header mit korrekten SHT-Feldern nachziehen */
+    eh.e_shoff     = sht_off;
+    eh.e_shentsize = sizeof(Elf64_Shdr);
+    eh.e_shnum     = (uint16_t)n_osec;
+    eh.e_shstrndx  = (uint16_t)idx_shstr;
+    fseek(out, 0, SEEK_SET);
+    fwrite(&eh, sizeof eh, 1, out);
+
     fclose(out);
     chmod(path, 0755);
 }
@@ -1198,16 +1484,6 @@ static void write_output(const char *path, const Layout *L, uint64_t entry_addr)
 /* ---------------------------------------------------------------------
  * Debug-Ausgabe: MAP-File-artige Uebersicht (siehe Dokument Abschnitt 9)
  * ------------------------------------------------------------------- */
-
-static const char *kind_name(SectionKind k) {
-    switch (k) {
-        case KIND_TEXT:   return ".text";
-        case KIND_RODATA: return ".rodata";
-        case KIND_DATA:   return ".data";
-        case KIND_BSS:    return ".bss";
-        default:          return "?";
-    }
-}
 
 /* qsort-Vergleich: definierte Symbole nach finaler Adresse */
 static int sym_addr_cmp(const void *a, const void *b) {
@@ -1390,6 +1666,8 @@ int main(int argc, char **argv) {
             lsl_path = argv[i];
         } else if (strncmp(argv[i], "--lsl=", 6) == 0) {
             lsl_path = argv[i] + 6;
+        } else if (strcmp(argv[i], "--debug") == 0 || strcmp(argv[i], "-g") == 0) {
+            g_debug_mode = 1;
         } else if (argv[i][0] == '-') {
             fprintf(stderr, "minilink: unbekannte Option '%s'\n", argv[i]);
             return 1;
@@ -1404,8 +1682,8 @@ int main(int argc, char **argv) {
 
     if (!output_path || n_inputs == 0) {
         fprintf(stderr,
-            "usage: %s (-T <script.ldl> | --lsl <script.lsl>) <input1.o> [...] -o <output>\n",
-            argv[0]);
+            "usage: %s (-T <script.ldl> | --lsl <script.lsl>) [--debug] "
+            "<input1.o> [...] -o <output>\n", argv[0]);
         return 1;
     }
 

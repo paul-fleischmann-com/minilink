@@ -37,6 +37,12 @@ dem TASKING-Linker (`ltc`) vergleicht.
   ELF64-Executables (`ET_EXEC`, ein bis N `PT_LOAD`-Segmente)
 - MAP-Ausgabe auf stdout und nach `minilink.map`: Script/Entry/Layout,
   Memory-Regionen, PT_LOAD-Segmente, Sektionen und Symbole (nach Adresse)
+- Minimaler „Debug behalten"-Modus (`--debug` / `-g`): `.debug_*`-Sections
+  über alle Eingabedateien konkateniert, ihre Relocations (auch die
+  DWARF-internen Section-zu-Section-Verweise) angewandt, eine echte
+  Section-Header-Tabelle plus rekonstruierte `.symtab` / `.strtab` /
+  `.shstrtab` geschrieben. Ergebnis: `addr2line`, `nm` und
+  `readelf --debug-dump` funktionieren, `gdb` bekommt Zeilennummern.
 
 ## Was bewusst fehlt (siehe Dokument, Abschnitt 10/13)
 
@@ -61,6 +67,11 @@ dem TASKING-Linker (`ltc`) vergleicht.
 - Keine Section-Garbage-Collection, kein ICF, kein LTO
 - Nur eine Handvoll Relocation-Typen (production-linker unterstützen
   dutzende, architekturabhängig)
+- `--debug` ist bewusst minimal: `.debug_*` werden nur konkateniert (kein
+  String-Merging in `.debug_str`, keine `.debug_line`-Deduplizierung,
+  keine `DW_AT_ranges`-Fixups), `.eh_frame`/`.eh_frame_hdr` fehlen
+  (Stack-Unwinding daher eingeschränkt), und `--debug` verlangt mit `-g`
+  übersetzte Objektdateien
 
 Das sind exakt die Punkte, die einen produktiven Linker (lld: ~100k
 Zeilen, TASKING: proprietär, vermutlich ähnliche Größenordnung) vom
@@ -69,48 +80,64 @@ aber identisch.
 
 ## Build & Test
 
-```bash
-# Testprogramm bauen (zwei .o-Dateien, um Symbolauflösung über
-# Dateigrenzen hinweg zu testen)
-gcc -c -ffreestanding -fno-pie -fno-stack-protector -O0 -o test/main.o test/main.c
-gcc -c -ffreestanding -fno-pie -fno-stack-protector -O0 -o test/msg.o  test/msg.c
+Am einfachsten: `./build_and_test.sh` baut minilink und linkt das
+Testprogramm in **drei Varianten** (je eigener Ordner unter `test/`),
+danach werden alle drei ausgeführt und geprüft:
 
+| Ordner       | Aufruf                                | Besonderheit                         |
+|--------------|--------------------------------------|-------------------------------------|
+| `test/none/` | `-T test/default.ldl`                | Standard, kein Debug                 |
+| `test/lsl/`  | `--lsl test/tc27x.lsl`               | ein `PT_LOAD` je genutzter Region   |
+| `test/g/`    | `-T test/default.ldl --debug` (`-g`) | Debug-Info behalten (DWARF, symtab) |
+
+Die `.o`-Dateien liegen direkt im Varianten-Ordner, das fertige
+Executable unter `test/<variante>/out/program`.
+
+Von Hand entspricht das:
+
+```bash
 # minilink selbst bauen
 gcc -O0 -g -Wall -o build/minilink src/minilink.c
 
-# Linken mit unserem eigenen Linker (nicht mit ld!)
-# Genau EIN Script ist Pflicht -- entweder -T oder --lsl:
-./build/minilink -T   test/default.ldl test/main.o test/msg.o -o test/program
-./build/minilink --lsl test/tc27x.lsl  test/main.o test/msg.o -o test/program_lsl
+# Objektdateien je Variante (test/none nur exemplarisch gezeigt)
+CF="-ffreestanding -fno-pie -fno-stack-protector -O0"
+mkdir -p test/none/out
+gcc -c $CF    -o test/none/main.o test/main.c
+gcc -c $CF    -o test/none/msg.o  test/msg.c
+
+# Linken mit unserem eigenen Linker (nicht mit ld!) -- genau EIN Script Pflicht
+./build/minilink -T test/default.ldl test/none/main.o test/none/msg.o -o test/none/out/program
 
 # Ausführen — läuft nativ unter Linux, kein Interpreter/keine Sandbox nötig
-./test/program
-./test/program_lsl
+./test/none/out/program
 ```
 
-Beide Varianten müssen dieselbe Ausgabe und denselben Exit-Code liefern;
-`--lsl` legt `.data` und `.bss` nur an andere (RAM-)Adressen — im
-Beispiel `test/tc27x.lsl` sogar in getrennte `PT_LOAD`-Segmente
-(`mem:ram` @ `0x800000`, `mem:ram2` @ `0xc00000`).
+Alle drei Varianten liefern dieselbe Ausgabe und Exit-Code `2` (beweist,
+dass `g_call_count` — in `msg.c` definiert, in `main.c` gelesen — über
+beide Objektdateien auf dieselbe finale Adresse zeigt). `--lsl` legt
+`.data`/`.bss` nur an andere (RAM-)Adressen, im Beispiel `test/tc27x.lsl`
+sogar in getrennte `PT_LOAD` (`mem:ram` @ `0x800000`, `mem:ram2` @
+`0xc00000`). Bei `test/g/` funktionieren zusätzlich:
 
-Exit-Code `2` (beweist, dass `g_call_count` — definiert in `msg.o`,
-inkrementiert bei jedem Aufruf, gelesen in `main.o` — über beide
-Objektdateien hinweg auf dieselbe finale Adresse zeigt).
-
-Am schnellsten: `./build_and_test.sh` baut, linkt beide Varianten und
-prüft Ausgabe + Exit-Code.
+```bash
+addr2line -e test/g/out/program -f 0x40101d   # -> _start / test/main.c:18
+readelf -S test/g/out/program | grep debug    # .debug_info, .debug_line, ...
+```
 
 ## Projektstruktur
 
 ```
 minilink/
-├── src/minilink.c      Der Linker selbst (eine Datei)
-├── test/main.c          Testprogramm Teil 1 (_start, Aufrufer)
-├── test/msg.c            Testprogramm Teil 2 (Definitionen, Syscalls)
-├── test/default.ldl     Minimales -T-Script (BASE_ADDR, PAGE_SIZE)
-├── test/tc27x.lsl       Vereinfachtes TASKING-LSL für --lsl
-├── build_and_test.sh    Baut + linkt (beide Script-Varianten) + prüft
-├── docs/elf-aufbau.*    ELF64-Aufbau als Referenz (adoc / puml / svg)
-├── build/minilink        Kompilierter Linker (nach Build)
-└── test/program[_lsl]     Vom eigenen Linker erzeugte Executables
+├── src/minilink.c        Der Linker selbst (eine Datei)
+├── build_and_test.sh     Baut + linkt (none / lsl / g) + prüft
+├── build/minilink         Kompilierter Linker (nach Build)
+├── docs/elf-aufbau.*      ELF64-Aufbau als Referenz (adoc / puml / svg)
+└── test/
+    ├── main.c             Testprogramm Teil 1 (_start, Aufrufer)
+    ├── msg.c              Testprogramm Teil 2 (Definitionen, Syscalls)
+    ├── default.ldl        Minimales -T-Script (BASE_ADDR, PAGE_SIZE)
+    ├── tc27x.lsl          Vereinfachtes TASKING-LSL für --lsl
+    ├── none/  main.o msg.o  out/program     (-T)
+    ├── lsl/   main.o msg.o  out/program     (--lsl)
+    └── g/     main.o msg.o  out/program     (-T --debug, mit -g)
 ```
