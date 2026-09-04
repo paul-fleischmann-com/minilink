@@ -1507,7 +1507,7 @@ static int sec_addr_cmp(const void *a, const void *b) {
     return 0;
 }
 
-/* Schreibt die vollstaendige MAP nach `out` (stdout und/oder minilink.map).
+/* Schreibt die vollstaendige MAP nach `out` (stdout bzw. <output>.map).
    entry_addr = Adresse von _start, script = "-T ..." bzw. "--lsl ...". */
 static const char *seg_of(const Layout *L, int seg_index) {
     return L->seg[seg_index].is_rw ? "RW" : "R-X";
@@ -1598,17 +1598,22 @@ static void emit_map(FILE *out, const Layout *L, uint64_t entry_addr, const char
     fprintf(out, "=====================\n");
 }
 
-static void print_map(const Layout *L, uint64_t entry_addr, const char *script) {
+static void print_map(const Layout *L, uint64_t entry_addr, const char *script,
+                      const char *output_path) {
     printf("\n");
     emit_map(stdout, L, entry_addr, script);
 
-    FILE *mf = fopen("minilink.map", "w");
+    /* MAP-Datei neben das -o-Ziel: <output_path>.map */
+    char map_path[512];
+    snprintf(map_path, sizeof map_path, "%s.map", output_path);
+
+    FILE *mf = fopen(map_path, "w");
     if (mf) {
         emit_map(mf, L, entry_addr, script);
         fclose(mf);
-        printf("minilink: MAP zusaetzlich geschrieben nach minilink.map\n\n");
+        printf("minilink: MAP zusaetzlich geschrieben nach %s\n\n", map_path);
     } else {
-        perror("minilink.map");
+        perror(map_path);
         printf("\n");
     }
 }
@@ -1744,7 +1749,7 @@ int main(int argc, char **argv) {
     char script_desc[300];
     snprintf(script_desc, sizeof script_desc, "%s %s",
              lsl_path ? "--lsl" : "-T", lsl_path ? lsl_path : ldl_path);
-    print_map(&L, entry_addr, script_desc);
+    print_map(&L, entry_addr, script_desc, output_path);
     printf("minilink: fertig. Einsprungpunkt _start @ 0x%08lx\n", entry_addr);
     return 0;
 }

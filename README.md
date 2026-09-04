@@ -35,8 +35,9 @@ dem TASKING-Linker (`ltc`) vergleicht.
   (absolute Referenzen)
 - Schreiben eines gültigen, direkt vom Linux-Kernel ladbaren
   ELF64-Executables (`ET_EXEC`, ein bis N `PT_LOAD`-Segmente)
-- MAP-Ausgabe auf stdout und nach `minilink.map`: Script/Entry/Layout,
-  Memory-Regionen, PT_LOAD-Segmente, Sektionen und Symbole (nach Adresse)
+- MAP-Ausgabe auf stdout und in `<output>.map` neben dem `-o`-Ziel:
+  Script/Entry/Layout, Memory-Regionen, PT_LOAD-Segmente, Sektionen und
+  Symbole (nach Adresse)
 - Minimaler „Debug behalten"-Modus (`--debug` / `-g`): `.debug_*`-Sections
   über alle Eingabedateien konkateniert, ihre Relocations (auch die
   DWARF-internen Section-zu-Section-Verweise) angewandt, eine echte
