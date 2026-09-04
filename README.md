@@ -25,15 +25,18 @@ dem TASKING-Linker (`ltc`) vergleicht.
   Relocations wie `.rodata`-Zugriffe auf statische Konstanten)
 - Section-Merging nach Typ (`.text`, `.rodata`, `.data`, `.bss`) über
   alle Eingabedateien
-- Statisches Speicher-Placement mit zwei Segmenten (R-X für Code,
-  RW für Daten), inklusive korrekter `.bss`-Behandlung (kein
-  Datei-Inhalt, aber virtueller Speicher via `p_memsz > p_filesz`)
+- Statisches Speicher-Placement: mit `-T` zwei Segmente (R-X für Code,
+  RW für Daten); mit `--lsl` **ein `PT_LOAD` je genutzter `memory`-
+  Region** (also z. B. `.data` und `.bss` an getrennten RAM-Adressen).
+  Korrekte `.bss`-Behandlung (kein Datei-Inhalt, aber virtueller
+  Speicher via `p_memsz > p_filesz`)
 - Relocation-Typen: `R_X86_64_PC32`, `R_X86_64_PLT32` (PC-relative
   Aufrufe/Zugriffe), `R_X86_64_64`, `R_X86_64_32`/`R_X86_64_32S`
   (absolute Referenzen)
 - Schreiben eines gültigen, direkt vom Linux-Kernel ladbaren
-  ELF64-Executables (`ET_EXEC`, zwei `PT_LOAD`-Segmente)
-- MAP-Datei-artige Ausgabe (Symbol → finale Adresse)
+  ELF64-Executables (`ET_EXEC`, ein bis N `PT_LOAD`-Segmente)
+- MAP-Ausgabe auf stdout und nach `minilink.map`: Script/Entry/Layout,
+  Memory-Regionen, PT_LOAD-Segmente, Sektionen und Symbole (nach Adresse)
 
 ## Was bewusst fehlt (siehe Dokument, Abschnitt 10/13)
 
@@ -44,13 +47,15 @@ dem TASKING-Linker (`ltc`) vergleicht.
   - `-T <datei>` — Miniscript mit `#define BASE_ADDR` / `#define PAGE_SIZE`
     (nur diese zwei Werte, keine Section-Platzierung). Beispiel:
     `test/default.ldl`.
-  - `--lsl <datei>` — stark vereinfachtes **TASKING-LSL**: `memory {}`-
-    Regionen (`type = rom|ram`, Adresse aus `map (dest_offset = …)`) und
-    `section_layout` / `group (… run_addr = mem:<id> …)` / `select
-    "<pattern>"` für Reihenfolge und Segment-Zuordnung der Output-Sections.
-    Damit landen z. B. `.data`/`.bss` an der RAM-Adresse aus dem Script,
-    getrennt vom Code. Alles Übrige (`architecture`, `bus`, `derivative`,
-    `section_setup`, …) wird überlesen. Beispiel: `test/tc27x.lsl`.
+  - `--lsl <datei>` — stark vereinfachtes **TASKING-LSL**: beliebig viele
+    `memory {}`-Regionen (`type = rom|ram`, Adresse aus
+    `map (dest_offset = …)`) und `section_layout` /
+    `group (… run_addr = mem:<id> …)` / `select "<pattern>"` für
+    Reihenfolge und Region-Zuordnung der Output-Sections. **Jede genutzte
+    Region wird ein eigenes `PT_LOAD`** — `.data` nach `mem:ram`, `.bss`
+    nach `mem:ram2` usw. landen an getrennten Adressen. Alles Übrige
+    (`architecture`, `bus`, `derivative`, `section_setup`, …) wird
+    überlesen. Beispiel: `test/tc27x.lsl` (rom / ram / ram2).
   Ein echtes LSL/GNU-ld-Script kann noch viel mehr (Copy-Tables,
   overlays, `align`/`fill`, mehrere Cores, …).
 - Keine Section-Garbage-Collection, kein ICF, kein LTO
@@ -84,7 +89,9 @@ gcc -O0 -g -Wall -o build/minilink src/minilink.c
 ```
 
 Beide Varianten müssen dieselbe Ausgabe und denselben Exit-Code liefern;
-`--lsl` platziert `.data`/`.bss` nur an einer anderen (RAM-)Adresse.
+`--lsl` legt `.data` und `.bss` nur an andere (RAM-)Adressen — im
+Beispiel `test/tc27x.lsl` sogar in getrennte `PT_LOAD`-Segmente
+(`mem:ram` @ `0x800000`, `mem:ram2` @ `0xc00000`).
 
 Exit-Code `2` (beweist, dass `g_call_count` — definiert in `msg.o`,
 inkrementiert bei jedem Aufruf, gelesen in `main.o` — über beide
