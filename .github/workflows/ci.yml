@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain-Versionen
+        run: |
+          gcc --version
+          rustc --version
+          cargo --version
+          readelf --version | head -1
+          addr2line --version | head -1
+
+      - name: build_and_test.sh (C + Rust, inkl. Byte-Identitaets-Check)
+        run: ./build_and_test.sh
