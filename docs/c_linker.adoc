@@ -1,0 +1,708 @@
+= Wie funktioniert der TASKING C Linker?
+
+== 1. Der Gesamtfluss
+
+Bei einer typischen TASKING-Toolchain:
+
+[source,text]
+----
+foo.c ──compiler──> foo.o
+bar.c ──compiler──> bar.o
+                         │
+                         ▼
+                  ┌─────────────┐
+                  │ TASKING      │
+                  │ C Linker     │
+                  └──────┬──────┘
+                         │
+              ┌──────────┴──────────┐
+              │                     │
+         Symbolauflösung       Section Placement
+              │                     │
+              └──────────┬──────────┘
+                         ▼
+                    ELF / HEX
+----
+
+Der Compiler erzeugt zunächst relocatable Objects.
+
+Beispielsweise enthält `foo.o`:
+
+[source,text]
+----
+.text.foo
+.data.foo
+
+Symbol:
+    foo
+    counter
+
+Undefined:
+    bar
+----
+
+Der Linker muss daraus ein fest adressiertes Programm machen.
+
+== 2. Was der Linker eigentlich lösen muss
+
+Im Kern hat er vier große Aufgaben:
+
+[source,text]
+----
+1. Input Sections einsammeln
+2. Symbole auflösen
+3. Speicherbereiche bestimmen
+4. Relocations durchführen
+----
+
+Beispiel:
+
+[source,c]
+----
+int counter = 42;
+
+void foo(void)
+{
+    bar();
+}
+----
+
+Der Compiler weiß beim Erzeugen von `foo.o` möglicherweise noch nicht:
+
+[source,text]
+----
+Adresse von bar = ?
+Adresse von counter = ?
+Adresse von foo = ?
+----
+
+Der Linker entscheidet später beispielsweise:
+
+[source,text]
+----
+.text.foo       → 0x80001000
+.text.bar       → 0x80001080
+.data.counter   → 0x70000000
+----
+
+Anschließend korrigiert er die entsprechenden Maschineninstruktionen bzw. Datenreferenzen.
+
+== 3. Sections sind wichtiger als Dateien
+
+Ein häufiger Denkfehler ist:
+
+[source,text]
+----
+foo.o → Adresse
+bar.o → Adresse
+----
+
+So funktioniert es nicht.
+
+Vielmehr:
+
+[source,text]
+----
+foo.o
+ ├── .text.foo
+ ├── .rodata.foo
+ ├── .data.foo
+ └── .bss.foo
+
+bar.o
+ ├── .text.bar
+ └── .rodata.bar
+----
+
+Der Linker entscheidet, wo diese Sections landen.
+
+Beispielsweise:
+
+[source,text]
+----
+FLASH
+0x80000000
+│
+├── .text.startup
+├── .text.foo
+├── .text.bar
+├── .rodata
+│
+└── ...
+
+RAM
+0x70000000
+│
+├── .data
+├── .bss
+├── stack
+└── heap
+----
+
+Das Linker Script beschreibt dabei die Placement-Regeln.
+
+== 4. Der interessante Teil: TASKING Linker
+
+Bei TASKING muss man insbesondere zwischen *Memory Regions* und *Sections / Groups* denken.
+
+Vereinfacht:
+
+[source,text]
+----
+Memory
+│
+├── ROM
+│
+└── RAM
+----
+
+Darauf werden Sections platziert:
+
+[source,text]
+----
+ROM
+ ├── code
+ ├── const
+ └── startup
+
+RAM
+ ├── initialized data
+ ├── zero initialized data
+ └── stack
+----
+
+TASKING besitzt eine ausgeprägte Linker-Script-Sprache.
+
+Die zentrale Idee ist:
+
+[source,text]
+----
+Input Section
+       │
+       ▼
+Placement Rule
+       │
+       ▼
+Output Section
+       │
+       ▼
+Memory Region
+----
+
+Die konkrete Syntax hängt von der jeweiligen TASKING-Toolchain und Zielarchitektur ab.
+
+== 5. Vereinfachtes Linker-Script
+
+Konzeptionell könnte ein Linker-Script beispielsweise so aussehen:
+
+[source,text]
+----
+memory
+{
+    FLASH : org = 0x80000000, len = 0x00100000
+    RAM   : org = 0x70000000, len = 0x00020000
+}
+
+sections
+{
+    .text   :
+    {
+        *(.text)
+    } > FLASH
+
+    .rodata :
+    {
+        *(.rodata)
+    } > FLASH
+
+    .data :
+    {
+        *(.data)
+    } > RAM
+
+    .bss :
+    {
+        *(.bss)
+    } > RAM
+}
+----
+
+NOTE: Die Syntax ist hier bewusst konzeptionell dargestellt. Die tatsächliche TASKING-Syntax hängt von Toolchain und Architektur ab.
+
+Die grundlegende Idee bleibt:
+
+[source,text]
+----
+Input Section
+       │
+       ▼
+Placement Rule
+       │
+       ▼
+Output Section
+       │
+       ▼
+Memory Region
+----
+
+== 6. Was passiert bei einem Funktionsaufruf?
+
+Nehmen wir:
+
+[source,c]
+----
+void foo(void)
+{
+    bar();
+}
+----
+
+Der Compiler erzeugt beispielsweise:
+
+[source,asm]
+----
+call bar
+----
+
+Aber `bar` ist in diesem Objektfile noch nicht endgültig bekannt.
+
+Im ELF steht deshalb sinngemäß:
+
+[source,text]
+----
+Relocation:
+    offset = 0x24
+    symbol = bar
+    type   = ...
+----
+
+Der Linker findet beispielsweise:
+
+[source,text]
+----
+bar = 0x80001080
+----
+
+und berechnet daraus den konkreten Wert, der in die Instruktion gehört.
+
+Das ist die *Relocation*.
+
+== 7. Symbolauflösung
+
+Angenommen:
+
+[source,text]
+----
+foo.o:
+    undefined bar
+
+bar.o:
+    defined bar
+----
+
+Dann baut der Linker daraus sinngemäß:
+
+[source,text]
+----
+foo.o                 bar.o
+  │                     │
+  │ undefined bar       │ defined bar
+  │                     │
+  └──────────┬──────────┘
+             ▼
+       Symbol table
+             │
+             ▼
+       bar = 0x80001080
+----
+
+Wenn dagegen zwei Objekte dasselbe globale Symbol definieren:
+
+[source,text]
+----
+foo.o → bar
+baz.o → bar
+----
+
+entsteht beispielsweise ein Fehler wie:
+
+[source,text]
+----
+multiple definition of 'bar'
+----
+
+== 8. Warum Linker Scripts bei Automotive so wichtig sind
+
+Bei AUTOSAR und Automotive-Embedded-Systemen gibt es häufig ein komplexes Memory-Modell.
+
+Beispielsweise:
+
+[source,text]
+----
+Bootloader
+Application
+Calibration
+Shared memory
+DMA buffers
+Interrupt vectors
+Core-local RAM
+----
+
+Man möchte nicht einfach alles nach FLASH und RAM verteilen.
+
+Bei einem Multicore-Mikrocontroller kann das beispielsweise konzeptionell so aussehen:
+
+[source,text]
+----
+             TC3xx
+              │
+       ┌──────┴──────┐
+       │             │
+     FLASH          RAM
+       │             │
+   ┌───┴───┐     ┌───┴────┐
+   │       │     │        │
+ code    const  DSPR     LMU
+               │
+             stack
+----
+
+Der Linker muss daher teilweise nicht nur wissen:
+
+"Wo passt diese Section hin?"
+
+sondern:
+
+"Auf welchem Core, in welchem Memory, mit welchen Alignment-, Access- und Placement-Regeln darf diese Section liegen?"
+
+== 9. GROUPS
+
+Ein wichtiges Konzept bei Embedded-Linkern ist, mehrere Sections logisch zusammenzufassen.
+
+Beispielsweise:
+
+[source,text]
+----
+GROUP Application
+{
+    .text
+    .rodata
+    .init
+}
+----
+
+Damit können Placement-Regeln auf eine Gruppe angewendet werden.
+
+Konzeptionell:
+
+[source,text]
+----
+              GROUP
+                │
+       ┌────────┼────────┐
+       ▼        ▼        ▼
+     .text    .rodata   .init
+       │        │        │
+       └────────┼────────┘
+                ▼
+             FLASH
+----
+
+Das ist bei komplexeren Memory-Layouts besonders nützlich.
+
+== 10. Load Address vs. Run Address
+
+Ein weiterer wichtiger Embedded-Linker-Begriff ist die Unterscheidung zwischen *Load Address* und *Run Address*.
+
+Beispielsweise:
+
+[source,text]
+----
+FLASH
+  │
+  │ initial contents
+  ▼
+.data image
+  │
+  │ startup copy
+  ▼
+RAM
+  │
+  ▼
+.data
+----
+
+Beispielsweise:
+
+[source,text]
+----
+Load:
+FLASH 0x80010000
+
+Run:
+RAM   0x70002000
+----
+
+Der Linker muss beide Adressen kennen.
+
+Der Startup-Code kopiert anschließend die initialisierten Daten:
+
+[source,c]
+----
+memcpy(
+    RAM_data,
+    FLASH_data,
+    data_size
+);
+----
+
+Die notwendigen Adressen und Größen werden typischerweise durch vom Linker bereitgestellte Symbole verfügbar gemacht.
+
+== 11. Alignment
+
+Angenommen:
+
+[source,c]
+----
+uint32_t x;
+----
+
+Dann soll `x` möglicherweise auf einer 4-Byte-Grenze liegen:
+
+[source,text]
+----
+0x70000000 ✓
+0x70000004 ✓
+0x70000008 ✓
+----
+
+aber:
+
+[source,text]
+----
+0x70000002 ✗
+----
+
+Der Linker kann entsprechende Placement-Regeln berücksichtigen.
+
+Bei DMA- und Ethernet-Buffern wird das besonders wichtig.
+
+Beispielsweise:
+
+[source,text]
+----
+Ethernet buffer
+alignment = 64 bytes
+----
+
+Dann muss die betreffende Section entsprechend ausgerichtet werden.
+
+== 12. Warum Linker-Fehler schwer zu verstehen sein können
+
+Ein Linkerfehler kann aus unterschiedlichen Ebenen kommen.
+
+=== Symbolproblem
+
+[source,text]
+----
+undefined symbol
+----
+
+Bedeutung: Eine benötigte Definition fehlt.
+
+=== Memory-Problem
+
+[source,text]
+----
+region overflowed
+----
+
+Bedeutung: Sections passen nicht mehr in den vorgesehenen Speicherbereich.
+
+=== Placement-Problem
+
+[source,text]
+----
+section cannot be allocated
+----
+
+Bedeutung: Die Placement-Regeln lassen keine gültige Platzierung zu.
+
+=== Alignment-Problem
+
+[source,text]
+----
+alignment constraint
+----
+
+Bedeutung: Die gewünschte Section-Anordnung kann wegen Alignment-Anforderungen nicht umgesetzt werden.
+
+=== Relocation-Problem
+
+[source,text]
+----
+relocation overflow
+----
+
+Bedeutung: Die Zieladresse kann mit dem vorgesehenen Relocation-Typ bzw. der verfügbaren Maschinenkodierung nicht dargestellt werden.
+
+== 13. Relocation Overflow
+
+Angenommen eine Architektur besitzt eine relative Branch-Instruktion mit begrenzter Reichweite.
+
+Der Compiler erzeugt:
+
+[source,text]
+----
+branch bar
+----
+
+und geht davon aus:
+
+[source,text]
+----
+bar ist innerhalb ±X
+----
+
+Der Linker platziert aber:
+
+[source,text]
+----
+foo = 0x80000000
+bar = 0x90000000
+----
+
+Dann passt der Offset möglicherweise nicht mehr in das dafür vorgesehene Feld.
+
+Der Linker kann melden:
+
+[source,text]
+----
+relocation overflow
+----
+
+Das ist *nicht einfach ein Speicherplatzproblem*.
+
+Es bedeutet:
+
+"Die gewählte Maschinenkodierung kann die vom Linker ermittelte Zieladresse nicht darstellen."
+
+Das ist ein wichtiger Unterschied.
+
+== 14. Was der Linker am Ende erzeugt
+
+Ein typischer ELF-Output enthält vereinfacht:
+
+[source,text]
+----
+ELF
+ │
+ ├── ELF headers
+ ├── Program/Section information
+ ├── .text
+ ├── .rodata
+ ├── .data
+ ├── .bss
+ ├── symbol table
+ ├── relocation information
+ └── debug information
+----
+
+Für Flash-Programmierung können daraus zusätzlich Formate wie HEX oder Binary erzeugt werden:
+
+[source,text]
+----
+ELF
+ │
+ ├── HEX
+ └── binary
+----
+
+== 15. Der wichtigste mentale Unterschied
+
+Eine oberflächliche Beschreibung wäre:
+
+"Der Linker verbindet Objektdateien."
+
+Für ein technisches Interview ist präziser:
+
+"Der Linker nimmt relocatable object files, löst deren Symbolabhängigkeiten auf, führt die notwendigen Relocations durch und platziert die daraus entstehenden Sections gemäß den Linker- und Memory-Constraints in das Ziel-Memory-Layout."
+
+Für Embedded-Systeme kann man noch ergänzen:
+
+"Dabei bestimmt er insbesondere Load- und Run-Adressen, Alignment, Memory-Region-Zuordnung und die finale Adressierung von Code und Daten."
+
+== 16. Der Kern als mentales Modell
+
+Das gesamte Konzept lässt sich auf folgende Struktur reduzieren:
+
+[source,text]
+----
+                TASKING Linker
+                      │
+       ┌──────────────┼──────────────┐
+       ▼              ▼              ▼
+   Input Objects   Linker Script   Libraries
+       │              │              │
+       ▼              ▼              ▼
+    Sections       Placement      Symbol resolution
+       │              │              │
+       └──────────────┼──────────────┘
+                      ▼
+                 Memory Layout
+                      │
+                      ▼
+                  Relocation
+                      │
+                      ▼
+                  ELF Output
+----
+
+Der eigentliche Kern ist damit:
+
+[source,text]
+----
+Symbols
+   +
+Sections
+   +
+Memory
+   +
+Relocations
+   +
+Constraints
+   ↓
+Final executable image
+----
+
+Für ein TASKING-Linker-Interview ist genau dieses mentale Modell besonders hilfreich.
+
+== 17. Bezug zu deinem bisherigen Embedded-Hintergrund
+
+Wenn man bereits Linker Scripts über verschiedene Compiler hinweg angepasst hat und mit ELF gearbeitet hat, lohnt sich im Interview eine Ebene tiefer.
+
+Dann sind insbesondere diese Themen interessant:
+
+* ELF Object Files
+* Section- und Symboltabellen
+* Relocation Records
+* Relocation Types
+* Symbol Resolution
+* Weak vs. Strong Symbols
+* Memory Regions
+* Section Placement
+* Groups
+* Alignment
+* Load Address / Run Address
+* Overlay-Konzepte
+* Libraries und Archive Resolution
+* Garbage Collection von Sections
+* Map File
+* Relocation Overflow
+* Multicore Memory Layout
+* Startup-Code und Initialisierung von `.data` / `.bss`
+
+Die zentrale Aussage bleibt:
+
+[quote]
+Der Linker ist nicht primär ein "Datei-Zusammenkleber", sondern ein System, das Symbolauflösung, Section Placement, Memory Constraints und Relocation zu einem final adressierten Embedded-Image zusammenführt.
