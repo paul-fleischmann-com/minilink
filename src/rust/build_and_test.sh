@@ -10,6 +10,13 @@
 #
 # Objektdateien liegen direkt im Varianten-Ordner (unter test/rust/),
 # die fertigen Executables unter test/rust/<variante>/out/.
+#
+# gcc wird dabei aus dem Repo-Root aufgerufen (genau wie im C-Skript
+# ../../build_and_test.sh), mit denselben relativen Pfaden (test/main.c
+# statt ../../test/main.c) -- sonst landet je nach Aufrufverzeichnis ein
+# anderer DWARF comp_dir/Directory-Table-Eintrag in den Objektdateien und
+# die --debug-Executables (Variante g) waeren trotz identischem Quellcode
+# nicht mehr byte-identisch zur C-Variante.
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -17,6 +24,7 @@ cd "$(dirname "$0")"
 CC="${CC:-gcc}"
 CFLAGS="-ffreestanding -fno-pie -fno-stack-protector -O0"
 TEST="../../test"
+ROOT="../.."
 
 EXPECTED_OUT="Hello from mini-linker!
 Hello from mini-linker 2 Hello from mini-linker 2 !
@@ -44,10 +52,12 @@ echo "==> [1/5] Varianten-Ordner + Objektdateien kompilieren"
 for v in none lsl g; do
 	mkdir -p "$TEST/rust/$v/out"
 	gflag=""; [ "$v" = g ] && gflag="-g"
+	# aus dem Repo-Root heraus aufrufen (siehe Kommentar oben) -- gleiche
+	# relative Pfade wie im C-Skript, damit -g denselben comp_dir einbettet
 	# shellcheck disable=SC2086
-	"$CC" -c $CFLAGS $gflag -o "$TEST/rust/$v/main.o" "$TEST/main.c"
+	(cd "$ROOT" && "$CC" -c $CFLAGS $gflag -o "test/rust/$v/main.o" test/main.c)
 	# shellcheck disable=SC2086
-	"$CC" -c $CFLAGS $gflag -o "$TEST/rust/$v/msg.o"  "$TEST/msg.c"
+	(cd "$ROOT" && "$CC" -c $CFLAGS $gflag -o "test/rust/$v/msg.o"  test/msg.c)
 done
 
 echo "==> [2/5] minilink (Rust) bauen (cargo build --release)"
