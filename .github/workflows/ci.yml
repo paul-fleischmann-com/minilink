@@ -20,3 +20,9 @@ jobs:
 
       - name: build_and_test.sh (C + Rust, inkl. Byte-Identitaets-Check)
         run: ./build_and_test.sh
+
+      - name: hyperfine installieren
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq hyperfine
+
+      - name: Linkzeit C vs. Rust messen (bench.sh)
+        run: ./bench.sh

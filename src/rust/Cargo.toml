@@ -6,3 +6,6 @@ edition = "2021"
 [[bin]]
 name = "minilink"
 path = "src/main.rs"
+
+[profile.release]
+strip = true
