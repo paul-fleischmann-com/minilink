@@ -14,6 +14,9 @@
 #
 # Danach wird zusaetzlich src/rust/build_and_test.sh ausgefuehrt, das
 # dieselbe Test-Matrix fuer die Rust-Portierung gegen test/rust/ prueft.
+# Zum Schluss wird per cmp geprueft, dass die von C- und Rust-Linker
+# erzeugten Executables (gleicher Quellcode, gleicher gcc-Aufruf) fuer
+# alle drei Varianten byte-identisch sind.
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -82,8 +85,22 @@ if ! ./src/rust/build_and_test.sh; then
 	FAIL=1
 fi
 
+echo
+echo "==> Vergleich: C- vs. Rust-Linker-Output (muss byte-identisch sein)"
+for v in none lsl g; do
+	c_prog="test/c/$v/out/program"
+	rust_prog="test/rust/$v/out/program"
+	if cmp -s "$c_prog" "$rust_prog"; then
+		echo "  $v: identisch ($c_prog == $rust_prog)"
+	else
+		echo "FEHLER ($v): C- und Rust-Output unterscheiden sich ($c_prog != $rust_prog)"
+		cmp "$c_prog" "$rust_prog" || true
+		FAIL=1
+	fi
+done
+
 if [ "$FAIL" -ne 0 ]; then
 	echo "==> TEST FEHLGESCHLAGEN"
 	exit 1
 fi
-echo "==> TEST OK (C + Rust)"
+echo "==> TEST OK (C + Rust, Output identisch)"
