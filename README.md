@@ -1,7 +1,7 @@
 # minilink — ein echter, minimaler ELF64-Linker
 
 > Es gibt auch eine 1:1-Portierung nach Rust mit identischem Funktionsumfang
-> und identischer Test-Matrix: siehe [`rust/`](rust/README.md).
+> und identischer Test-Matrix: siehe [`src/rust/`](src/rust/README.md).
 
 Ein von Grund auf neu geschriebener Linker in C, der reale, mit `gcc`
 kompilierte ELF64-Objektdateien (`.o`) einliest, Symbole über Dateigrenzen
@@ -56,7 +56,7 @@ dem TASKING-Linker (`ltc`) vergleicht.
   eingebautes Default-Layout, ohne Script bricht `minilink` ab):
   - `-T <datei>` — Miniscript mit `#define BASE_ADDR` / `#define PAGE_SIZE`
     (nur diese zwei Werte, keine Section-Platzierung). Beispiel:
-    `test/default.ldl`.
+    `test/default.ldl` (gemeinsam von C- und Rust-Implementierung genutzt).
   - `--lsl <datei>` — stark vereinfachtes **TASKING-LSL**: beliebig viele
     `memory {}`-Regionen (`type = rom|ram`, Adresse aus
     `map (dest_offset = …)`) und `section_layout` /
@@ -85,35 +85,35 @@ aber identisch.
 ## Build & Test
 
 Am einfachsten: `./build_and_test.sh` baut minilink und linkt das
-Testprogramm in **drei Varianten** (je eigener Ordner unter `test/`),
+Testprogramm in **drei Varianten** (je eigener Ordner unter `test/c/`),
 danach werden alle drei ausgeführt und geprüft:
 
-| Ordner       | Aufruf                                | Besonderheit                         |
-|--------------|--------------------------------------|-------------------------------------|
-| `test/none/` | `-T test/default.ldl`                | Standard, kein Debug                 |
-| `test/lsl/`  | `--lsl test/tc27x.lsl`               | ein `PT_LOAD` je genutzter Region   |
-| `test/g/`    | `-T test/default.ldl --debug` (`-g`) | Debug-Info behalten (DWARF, symtab) |
+| Ordner         | Aufruf                                | Besonderheit                         |
+|----------------|----------------------------------------|-------------------------------------|
+| `test/c/none/` | `-T test/default.ldl`                | Standard, kein Debug                 |
+| `test/c/lsl/`  | `--lsl test/tc27x.lsl`               | ein `PT_LOAD` je genutzter Region   |
+| `test/c/g/`    | `-T test/default.ldl --debug` (`-g`) | Debug-Info behalten (DWARF, symtab) |
 
 Die `.o`-Dateien liegen direkt im Varianten-Ordner, das fertige
-Executable unter `test/<variante>/out/program`.
+Executable unter `test/c/<variante>/out/program`.
 
 Von Hand entspricht das:
 
 ```bash
 # minilink selbst bauen
-gcc -O0 -g -Wall -o build/minilink src/minilink.c
+gcc -O0 -g -Wall -o build/minilink src/c/minilink.c
 
-# Objektdateien je Variante (test/none nur exemplarisch gezeigt)
+# Objektdateien je Variante (test/c/none nur exemplarisch gezeigt)
 CF="-ffreestanding -fno-pie -fno-stack-protector -O0"
-mkdir -p test/none/out
-gcc -c $CF    -o test/none/main.o test/main.c
-gcc -c $CF    -o test/none/msg.o  test/msg.c
+mkdir -p test/c/none/out
+gcc -c $CF    -o test/c/none/main.o test/main.c
+gcc -c $CF    -o test/c/none/msg.o  test/msg.c
 
 # Linken mit unserem eigenen Linker (nicht mit ld!) -- genau EIN Script Pflicht
-./build/minilink -T test/default.ldl test/none/main.o test/none/msg.o -o test/none/out/program
+./build/minilink -T test/default.ldl test/c/none/main.o test/c/none/msg.o -o test/c/none/out/program
 
 # Ausführen — läuft nativ unter Linux, kein Interpreter/keine Sandbox nötig
-./test/none/out/program
+./test/c/none/out/program
 ```
 
 Alle drei Varianten liefern dieselbe Ausgabe und Exit-Code `2` (beweist,
@@ -121,27 +121,35 @@ dass `g_call_count` — in `msg.c` definiert, in `main.c` gelesen — über
 beide Objektdateien auf dieselbe finale Adresse zeigt). `--lsl` legt
 `.data`/`.bss` nur an andere (RAM-)Adressen, im Beispiel `test/tc27x.lsl`
 sogar in getrennte `PT_LOAD` (`mem:ram` @ `0x800000`, `mem:ram2` @
-`0xc00000`). Bei `test/g/` funktionieren zusätzlich:
+`0xc00000`). Bei `test/c/g/` funktionieren zusätzlich:
 
 ```bash
-addr2line -e test/g/out/program -f 0x40101d   # -> _start / test/main.c:18
-readelf -S test/g/out/program | grep debug    # .debug_info, .debug_line, ...
+addr2line -e test/c/g/out/program -f 0x40101d   # -> _start / test/main.c:18
+readelf -S test/c/g/out/program | grep debug    # .debug_info, .debug_line, ...
 ```
+
+Die Rust-Portierung (`src/rust/`) hat ihr eigenes `build_and_test.sh` und
+schreibt ihre Varianten nach `test/rust/` — siehe
+[`src/rust/README.md`](src/rust/README.md).
 
 ## Projektstruktur
 
 ```
 minilink/
-├── src/minilink.c        Der Linker selbst (eine Datei)
-├── build_and_test.sh     Baut + linkt (none / lsl / g) + prüft
-├── build/minilink         Kompilierter Linker (nach Build)
-├── docs/elf-aufbau.*      ELF64-Aufbau als Referenz (adoc / puml / svg)
+├── src/
+│   ├── c/minilink.c        Der C-Linker selbst (eine Datei)
+│   └── rust/                Rust-Portierung (eigenes Cargo-Projekt, siehe src/rust/README.md)
+├── build_and_test.sh       Baut + linkt (C: none / lsl / g) + prüft
+├── build/minilink           Kompilierter C-Linker (nach Build)
+├── docs/elf-aufbau.*        ELF64-Aufbau als Referenz (adoc / puml / svg)
 └── test/
-    ├── main.c             Testprogramm Teil 1 (_start, Aufrufer)
-    ├── msg.c              Testprogramm Teil 2 (Definitionen, Syscalls)
-    ├── default.ldl        Minimales -T-Script (BASE_ADDR, PAGE_SIZE)
-    ├── tc27x.lsl          Vereinfachtes TASKING-LSL für --lsl
-    ├── none/  main.o msg.o  out/program     (-T)
-    ├── lsl/   main.o msg.o  out/program     (--lsl)
-    └── g/     main.o msg.o  out/program     (-T --debug, mit -g)
+    ├── main.c               Testprogramm Teil 1 (_start, Aufrufer)
+    ├── msg.c                Testprogramm Teil 2 (Definitionen, Syscalls)
+    ├── default.ldl          Minimales -T-Script (BASE_ADDR, PAGE_SIZE)
+    ├── tc27x.lsl            Vereinfachtes TASKING-LSL für --lsl
+    ├── c/                   Test-Varianten der C-Implementierung
+    │   ├── none/  main.o msg.o  out/program     (-T)
+    │   ├── lsl/   main.o msg.o  out/program     (--lsl)
+    │   └── g/     main.o msg.o  out/program     (-T --debug, mit -g)
+    └── rust/                Test-Varianten der Rust-Implementierung (gleiche Struktur)
 ```
