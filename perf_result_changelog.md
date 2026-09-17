@@ -12,3 +12,11 @@ vergleicht das Ergebnis mit dem vorherigen Lauf. Niedriger ist besser
 Neueste Eintraege stehen oben.
 
 <!-- NEUE EINTRAEGE WERDEN HIER VON changelog_entry.sh EINGEFUEGT -->
+## 2026-09-17 -- Commit `3c01eb5`
+
+_Erstlauf (kein vorheriges Profiling-Ergebnis im Cache) -- kein Vergleich moeglich._
+
+**C**: 1016111 Instruktionen (Ir), Variante `g`.
+
+**Rust**: 1277807 Instruktionen (Ir), Variante `g`.
+
