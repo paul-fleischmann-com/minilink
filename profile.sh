@@ -20,10 +20,18 @@
 #
 # Ergebnis: Top-15-Funktionen je Linker nach Instruktionsanteil (Variante
 # g, d.h. -T test/default.ldl --debug), nach stdout und zusaetzlich nach
-# $GITHUB_STEP_SUMMARY, falls gesetzt.
+# $GITHUB_STEP_SUMMARY, falls gesetzt. Zusaetzlich strukturiertes JSON
+# (Gesamt-Instruktionen + alle von callgrind_annotate gelisteten
+# Funktionen) nach profile-results/current.json -- Grundlage fuer den
+# Vorher/Nachher-Vergleich in changelog_entry.sh.
 
 set -euo pipefail
 cd "$(dirname "$0")"
+
+command -v jq >/dev/null 2>&1 || {
+	echo "profile.sh: jq nicht gefunden (apt install jq)" >&2
+	exit 1
+}
 
 command -v valgrind >/dev/null 2>&1 || {
 	echo "profile.sh: valgrind nicht gefunden (apt install valgrind)" >&2
@@ -61,8 +69,28 @@ emit "Instruktionen (\`Ir\`), Variante \`g\` (\`-T test/default.ldl --debug\`)."
 emit "Deterministisch (Instruktionszaehler statt Wall-Clock-Sampling)."
 emit ""
 
+RESULTS_DIR="profile-results"
+mkdir -p "$RESULTS_DIR"
+C_JSON="$TMP/c.json"
+RUST_JSON="$TMP/rust.json"
+
+# callgrind_annotate gibt mehrere Abschnitte aus (globale Funktionstabelle,
+# danach je Quelldatei annotierter Sourcecode -- dort tauchen dieselben
+# Funktionsnamen nochmal mit voellig anderen (inklusiven) Zahlen auf). Diese
+# State-Machine schneidet NUR die erste Tabelle heraus (zwischen den beiden
+# Trennlinien direkt nach der "Ir  file:function"-Kopfzeile).
+annotate_table() {
+	awk '
+		BEGIN { state = 0 }
+		state == 0 && /file:function/ { state = 1; next }
+		state == 1 && /^-+$/          { state = 2; next }
+		state == 2 && /^-+$/          { state = 3; next }
+		state == 2                    { print }
+	'
+}
+
 profile_one() {
-	local name="$1" bin="$2"
+	local name="$1" bin="$2" json_out="$3"
 	local out="$TMP/cg_$name.out"
 
 	echo "==> Profiling: $name"
@@ -70,14 +98,39 @@ profile_one() {
 		"$bin" -T test/default.ldl --debug \
 		test/c/g/main.o test/c/g/msg.o -o "$TMP/out_$name" >/dev/null
 
-	# awk liest bewusst bis EOF (kein "exit"/kein "head", das die Pipe
-	# vorzeitig schliesst) -- sonst bricht callgrind_annotate mit SIGPIPE
-	# ab, was set -o pipefail als Fehler werten wuerde.
-	local total top
-	total="$(callgrind_annotate "$out" 2>/dev/null | awk '/PROGRAM TOTALS/ && !d {print $1; d=1}')"
-	top="$(callgrind_annotate "$out" 2>/dev/null | awk '/file:function/{f=1;next} f{if(n<15){print; n++}}')"
+	# awk liest bewusst bis EOF (kein "exit", das die Pipe vorzeitig
+	# schliesst) -- sonst bricht callgrind_annotate mit SIGPIPE ab, was
+	# set -o pipefail als Fehler werten wuerde.
+	local total_raw total top functions_tsv
+	total_raw="$(callgrind_annotate "$out" 2>/dev/null | awk '/PROGRAM TOTALS/ && !d {print $1; d=1}')"
+	total="${total_raw//,/}"
+	top="$(callgrind_annotate "$out" 2>/dev/null | annotate_table | awk '{if(n<15){print; n++}}')"
 
-	emit "### $name (insgesamt $total Instruktionen)"
+	# Alle von callgrind_annotate in der ersten Tabelle gelisteten
+	# Funktionen (nicht nur Top 15) als "instruktionen<TAB>funktionsname"
+	# -- fuer den JSON-Export/Vergleich. Funktionsname = Text nach dem
+	# LETZTEN ':' vor einem optionalen " [binaerpfad]"-Suffix (Dateipfade
+	# koennen selbst ':' enthalten).
+	functions_tsv="$(callgrind_annotate "$out" 2>/dev/null \
+		| annotate_table \
+		| sed -E 's/^[[:space:]]*([0-9,]+)[^:]*:([^ ]+).*/\1\t\2/' \
+		| awk -F'\t' 'NF==2{gsub(",","",$1); print $1"\t"$2}')"
+
+	# Gleicher Funktionsname kann mehrfach auftauchen (z.B. an mehreren
+	# Inlining-/Aufrufstellen) -- Werte je Name aufsummieren statt den
+	# letzten Treffer zu behalten.
+	jq -n --argjson total "$total" \
+		--arg tsv "$functions_tsv" \
+		'{total_ir: $total,
+		  functions: (
+		    [$tsv | split("\n")[] | select(length>0) | split("\t") | {name: .[1], ir: (.[0]|tonumber)}]
+		    | group_by(.name)
+		    | map({(.[0].name): (map(.ir) | add)})
+		    | add // {}
+		  )}' \
+		> "$json_out"
+
+	emit "### $name (insgesamt $total_raw Instruktionen)"
 	emit ""
 	emit '```'
 	emit "$top"
@@ -85,5 +138,14 @@ profile_one() {
 	emit ""
 }
 
-profile_one "C"    "$C_BIN"
-profile_one "Rust" "$RS_BIN"
+profile_one "C"    "$C_BIN" "$C_JSON"
+profile_one "Rust" "$RS_BIN" "$RUST_JSON"
+
+commit="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+generated_at="$(date -u +%FT%TZ)"
+jq -n --arg commit "$commit" --arg generated_at "$generated_at" \
+	--slurpfile c "$C_JSON" --slurpfile rust "$RUST_JSON" \
+	'{commit: $commit, generated_at: $generated_at, linkers: {C: $c[0], Rust: $rust[0]}}' \
+	> "$RESULTS_DIR/current.json"
+
+echo "==> Ergebnis: $RESULTS_DIR/current.json"

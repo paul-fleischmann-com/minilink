@@ -1,0 +1,14 @@
+= minilink: Profiling-Changelog (C vs. Rust)
+
+Automatisch generiert vom woechentlichen `Weekly Profiling`-Workflow
+(`.github/workflows/profile.yml`, siehe auch `profile.sh` und
+`changelog_entry.sh`). Misst per `valgrind --tool=callgrind` die
+ausgefuehrten Instruktionen (`Ir`, deterministisch, kein Wall-Clock-Sampling)
+beim Linken der Testvariante `g` (`-T test/default.ldl --debug`) mit
+`build/minilink` (C) bzw. `src/rust/target/release/minilink` (Rust) und
+vergleicht das Ergebnis mit dem vorherigen Lauf. Niedriger ist besser
+(weniger Instruktionen).
+
+Neueste Eintraege stehen oben.
+
+// NEUE EINTRAEGE WERDEN HIER VON changelog_entry.sh EINGEFUEGT

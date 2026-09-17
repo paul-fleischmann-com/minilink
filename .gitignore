@@ -1,0 +1,3 @@
+# profile.sh-Ergebnisse (current.json/baseline.json) -- laufzeitgeneriert,
+# in CI ueber actions/cache persistiert, nicht Teil des Repos.
+/profile-results/

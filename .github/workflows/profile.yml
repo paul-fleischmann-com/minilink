@@ -6,6 +6,10 @@ on:
     - cron: "0 3 * * 1"
   workflow_dispatch: {}
 
+permissions:
+  contents: write
+  pull-requests: write
+
 jobs:
   profile:
     runs-on: ubuntu-latest
@@ -21,8 +25,49 @@ jobs:
       - name: valgrind installieren
         run: sudo apt-get update -qq && sudo apt-get install -y -qq valgrind
 
+      - name: Vorheriges Profiling-Ergebnis laden (Cache)
+        uses: actions/cache@v4
+        with:
+          path: profile-results/baseline.json
+          key: profile-baseline-${{ github.run_id }}
+          restore-keys: |
+            profile-baseline-
+
       - name: build_and_test.sh (baut beide Linker + Testvarianten)
         run: ./build_and_test.sh
 
       - name: Instruktionsprofil C vs. Rust (profile.sh)
         run: ./profile.sh
+
+      - name: Vergleich zum vorherigen Lauf + Changelog-Eintrag
+        run: |
+          mkdir -p profile-results
+          # profile-results/baseline.json existiert nur, wenn der
+          # Cache-Restore-Schritt oben einen Treffer hatte (sonst leer/fehlt
+          # -> changelog_entry.sh erzeugt dann einen Erstlauf-Eintrag).
+          ./changelog_entry.sh profile-results/baseline.json profile-results/current.json md   | tee /tmp/entry.md   >> "$GITHUB_STEP_SUMMARY"
+          ./changelog_entry.sh profile-results/baseline.json profile-results/current.json adoc  > /tmp/entry.adoc
+          ./insert_changelog_entry.sh perf_result_changelog.md   /tmp/entry.md   "<!-- NEUE EINTRAEGE"
+          ./insert_changelog_entry.sh perf_result_changelog.adoc /tmp/entry.adoc "NEUE EINTRAEGE"
+          # aktuelles Ergebnis wird zur naechsten Baseline (fuer den
+          # Cache-Save am Ende des Jobs, siehe Schritt oben)
+          cp profile-results/current.json profile-results/baseline.json
+
+      - name: Changelog-PR erstellen
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if git diff --quiet -- perf_result_changelog.md perf_result_changelog.adoc; then
+            echo "Kein Unterschied im Changelog -- keine PR noetig."
+            exit 0
+          fi
+          branch="profiling/weekly-${{ github.run_id }}"
+          git checkout -b "$branch"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add perf_result_changelog.md perf_result_changelog.adoc
+          git commit -m "Weekly Profiling: C vs. Rust Instruktionsvergleich ($(date -u +%F))"
+          git push origin "$branch"
+          gh pr create --base main --head "$branch" \
+            --title "Weekly Profiling: $(date -u +%F)" \
+            --body-file /tmp/entry.md
