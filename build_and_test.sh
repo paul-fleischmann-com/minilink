@@ -74,8 +74,12 @@ check_program "g"    ./test/c/g/out/program
 
 echo "--- g: DWARF pruefen ---"
 readelf -SW test/c/g/out/program | grep -q '\.debug_info' || { echo "FEHLER (g): .debug_info fehlt"; FAIL=1; }
-a2l="$(addr2line -e test/c/g/out/program -f 0x40101d | head -1 || true)"
-echo "addr2line 0x40101d -> $a2l"
+# Entry-Adresse aus dem ELF-Header lesen statt hartzukodieren -- der exakte
+# Offset von _start haengt vom gcc-Codegen ab und unterscheidet sich je
+# nach gcc-Version (z.B. lokal vs. CI-Runner).
+entry="$(readelf -h test/c/g/out/program | sed -n 's/.*Entry point address:\s*//p')"
+a2l="$(addr2line -e test/c/g/out/program -f "$entry" | head -1 || true)"
+echo "addr2line $entry -> $a2l"
 [ "$a2l" = "_start" ] || { echo "FEHLER (g): addr2line liefert '$a2l' statt '_start'"; FAIL=1; }
 
 echo

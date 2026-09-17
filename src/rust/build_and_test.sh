@@ -78,8 +78,11 @@ check_program "g"    "$TEST/rust/g/out/program"
 
 echo "--- g: DWARF pruefen ---"
 readelf -SW "$TEST/rust/g/out/program" | grep -q '\.debug_info' || { echo "FEHLER (g): .debug_info fehlt"; FAIL=1; }
-a2l="$(addr2line -e "$TEST/rust/g/out/program" -f 0x40101d | head -1 || true)"
-echo "addr2line 0x40101d -> $a2l"
+# Entry-Adresse aus dem ELF-Header lesen statt hartzukodieren -- siehe
+# Kommentar in ../../build_and_test.sh.
+entry="$(readelf -h "$TEST/rust/g/out/program" | sed -n 's/.*Entry point address:\s*//p')"
+a2l="$(addr2line -e "$TEST/rust/g/out/program" -f "$entry" | head -1 || true)"
+echo "addr2line $entry -> $a2l"
 [ "$a2l" = "_start" ] || { echo "FEHLER (g): addr2line liefert '$a2l' statt '_start'"; FAIL=1; }
 
 if [ "$FAIL" -ne 0 ]; then
