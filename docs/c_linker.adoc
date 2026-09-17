@@ -245,13 +245,25 @@ Output Section
 Memory Region
 ----
 
-| Begriff                  | In unserem Beispiel          |
-| ------------------------ | ---------------------------- |
-| **Input Section**        | `foo.o:.text`                |
-| **Selection / Selector** | `*(.text)`                   |
-| **Output Section**       | `.text`                      |
-| **Memory Region**        | `FLASH`                      |
-| **Placement Rule**       | `.text { *(.text) } > FLASH` |
+[cols="1,1", options="header"]
+|===
+|Begriff |In unserem Beispiel
+
+|Input Section
+|foo.o:.text
+
+|Selection / Selector
+|*(.text)
+
+|Output Section
+|.text
+
+|Memory Region
+|FLASH
+
+|Placement Rule
+|.text { *(.text) } > FLASH
+|===
 
 
 == 6. Was passiert bei einem Funktionsaufruf?
