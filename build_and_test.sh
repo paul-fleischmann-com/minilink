@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
 #
-# build_and_test.sh — baut minilink und linkt das Testprogramm in drei
-# Varianten, jede in ihrem eigenen Unterordner unter test/:
+# build_and_test.sh — baut die C-Implementierung (src/c/minilink.c) und
+# linkt das Testprogramm in drei Varianten, jede in ihrem eigenen
+# Unterordner unter test/c/:
 #
 #   test/c/none/  -T test/default.ldl                (kein Debug)
 #   test/c/lsl/   --lsl test/tc27x.lsl               (mehrere PT_LOAD)
 #   test/c/g/     -T test/default.ldl --debug        (Debug-Info behalten, -g)
 #
 # Objektdateien liegen direkt im Varianten-Ordner, die fertigen
-# Executables unter test/<variante>/out/.
+# Executables unter test/c/<variante>/out/.
 # Prueft je Variante Ausgabe + Exit-Code, bei --debug zusaetzlich DWARF.
+#
+# Danach wird zusaetzlich src/rust/build_and_test.sh ausgefuehrt, das
+# dieselbe Test-Matrix fuer die Rust-Portierung gegen test/rust/ prueft.
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -71,8 +75,15 @@ a2l="$(addr2line -e test/c/g/out/program -f 0x40101d | head -1 || true)"
 echo "addr2line 0x40101d -> $a2l"
 [ "$a2l" = "_start" ] || { echo "FEHLER (g): addr2line liefert '$a2l' statt '_start'"; FAIL=1; }
 
+echo
+echo "==> Rust-Portierung: src/rust/build_and_test.sh"
+if ! ./src/rust/build_and_test.sh; then
+	echo "FEHLER: Rust-Testsuite fehlgeschlagen"
+	FAIL=1
+fi
+
 if [ "$FAIL" -ne 0 ]; then
 	echo "==> TEST FEHLGESCHLAGEN"
 	exit 1
 fi
-echo "==> TEST OK"
+echo "==> TEST OK (C + Rust)"
