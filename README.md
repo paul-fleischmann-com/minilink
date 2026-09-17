@@ -1,5 +1,8 @@
 # minilink — ein echter, minimaler ELF64-Linker
 
+> Es gibt auch eine 1:1-Portierung nach Rust mit identischem Funktionsumfang
+> und identischer Test-Matrix: siehe [`rust/`](rust/README.md).
+
 Ein von Grund auf neu geschriebener Linker in C, der reale, mit `gcc`
 kompilierte ELF64-Objektdateien (`.o`) einliest, Symbole über Dateigrenzen
 hinweg auflöst, Relocations anwendet und ein **lauffähiges** statisches
