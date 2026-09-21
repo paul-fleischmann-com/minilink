@@ -12,3 +12,53 @@ vergleicht das Ergebnis mit dem vorherigen Lauf. Niedriger ist besser
 Neueste Eintraege stehen oben.
 
 // NEUE EINTRAEGE WERDEN HIER VON changelog_entry.sh EINGEFUEGT
+== 2026-09-21 -- Commit `3c01eb5`
+
+Vergleich zu Commit `3c01eb5`.
+
+=== C -- Gesamt: 🔴 schlechter
+
+[cols="1,1,1,1",options="header"]
+|===
+| Metrik
+| vorher
+| jetzt
+| Delta
+| Instruktionen (Ir)
+| 1016111
+| 1016121
+| 10 (+0.00%)
+|===
+
+_Keine Aenderung bei den erfassten Funktionen._
+
+=== Rust -- Gesamt: 🔴 schlechter
+
+[cols="1,1,1,1",options="header"]
+|===
+| Metrik
+| vorher
+| jetzt
+| Delta
+| Instruktionen (Ir)
+| 1277807
+| 1277821
+| 14 (+0.00%)
+|===
+
+==== Funktionen mit Aenderung
+
+[cols="1,1,1,1,1",options="header"]
+|===
+| Funktion
+| vorher
+| jetzt
+| Delta
+| 
+| `__strlen_avx2`
+| 1372
+| 1376
+| 4
+| 🔴
+|===
+
