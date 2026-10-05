@@ -12,3 +12,23 @@ vergleicht das Ergebnis mit dem vorherigen Lauf. Niedriger ist besser
 Neueste Eintraege stehen oben.
 
 <!-- NEUE EINTRAEGE WERDEN HIER VON changelog_entry.sh EINGEFUEGT -->
+## 2026-10-05 -- Commit `3c01eb5`
+
+Vergleich zu Commit `3c01eb5`.
+
+### C -- Gesamt: ⚪ unveraendert
+
+| Metrik | vorher | jetzt | Delta |
+|---|---|---|---|
+| Instruktionen (Ir) | 1016121 | 1016121 | 0 (+0.00%) |
+
+_Keine Aenderung bei den erfassten Funktionen._
+
+### Rust -- Gesamt: ⚪ unveraendert
+
+| Metrik | vorher | jetzt | Delta |
+|---|---|---|---|
+| Instruktionen (Ir) | 1277821 | 1277821 | 0 (+0.00%) |
+
+_Keine Aenderung bei den erfassten Funktionen._
+
