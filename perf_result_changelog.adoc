@@ -12,3 +12,58 @@ vergleicht das Ergebnis mit dem vorherigen Lauf. Niedriger ist besser
 Neueste Eintraege stehen oben.
 
 // NEUE EINTRAEGE WERDEN HIER VON changelog_entry.sh EINGEFUEGT
+== 2026-11-02 -- Commit `3c01eb5`
+
+Vergleich zu Commit `3c01eb5`.
+
+=== C -- Gesamt: ⚪ unveraendert
+
+[cols="1,1,1,1",options="header"]
+|===
+| Metrik
+| vorher
+| jetzt
+| Delta
+| Instruktionen (Ir)
+| 1016121
+| 1016121
+| 0 (+0.00%)
+|===
+
+_Keine Aenderung bei den erfassten Funktionen._
+
+=== Rust -- Gesamt: 🔴 schlechter
+
+[cols="1,1,1,1",options="header"]
+|===
+| Metrik
+| vorher
+| jetzt
+| Delta
+| Instruktionen (Ir)
+| 1268442
+| 1268528
+| 86 (+0.01%)
+|===
+
+==== Funktionen mit Aenderung
+
+[cols="1,1,1,1,1",options="header"]
+|===
+| Funktion
+| vorher
+| jetzt
+| Delta
+| 
+| `core::slice::memchr::memrchr_aligned`
+| 77662
+| 77762
+| 100
+| 🔴
+| `strcspn`
+| 254
+| 240
+| -14
+| 🟢
+|===
+
